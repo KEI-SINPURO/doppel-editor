@@ -1,0 +1,7 @@
+# Streamlit Community Cloud（Debianベース）で apt-get 経由でインストールされる。
+# ffmpeg      : openai-whisper が音声を読み込むために必須（subprocessで直接呼び出す）
+# libgl1      : opencv-python が "libGL.so.1" 不足で落ちるのを防ぐ
+# libglib2.0-0: opencv-python の依存ライブラリ
+ffmpeg
+libgl1
+libglib2.0-0

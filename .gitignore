@@ -1,0 +1,16 @@
+# 環境変数（APIキーを含むため絶対にコミットしない）
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+
+# エディタ
+.vscode/settings.json

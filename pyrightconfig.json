@@ -1,0 +1,11 @@
+{
+  "venvPath": ".",
+  "venv": "venv",
+  "typeCheckingMode": "basic",
+  "reportMissingModuleSource": "none",
+  "exclude": [
+    "**/__pycache__",
+    "**/venv",
+    "**/.venv"
+  ]
+}

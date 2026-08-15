@@ -1,0 +1,41 @@
+# ============================================================
+# Doppel Editor 必要パッケージ一覧（v2: Claude API版）
+#
+# インストール方法:
+#   source venv/bin/activate
+#   pip install -r requirements.txt
+#
+# 【v1からの変更点】
+#   - ollama を削除（ローカルAIサーバーを廃止したため）
+#   - anthropic を追加（Claude APIを使用）
+#   - psutil を削除（ハードウェアに応じたローカルモデル自動選択が不要になったため）
+# ============================================================
+
+# Webアプリフレームワーク
+# ★ Streamlit公式の推奨で上限を付けて固定している（Community Cloudは指定が緩いと
+#   予告なく最新版に上がり、突然の仕様変更で動かなくなることがあるため）
+streamlit>=1.38.0,<2.0.0
+
+# データベース（ユーザー認証・データ保存）／Google OAuthのPKCEフローに対応したバージョン
+supabase>=2.4.0
+
+# 環境変数（.envファイルの読み込み）
+python-dotenv>=1.0.0
+
+# Claude API（Anthropic） https://console.anthropic.com でAPIキーを発行してください
+anthropic>=0.40.0
+
+# 動画編集（テロップ焼き込み・エフェクト・カット・ロゴ/BGM合成）
+moviepy==1.0.3
+
+# 動画分析（カット検出・テロップ色解析）
+opencv-python>=4.8.0
+
+# 音声文字起こし（Whisper）
+openai-whisper>=20231117
+
+# 数値計算（エフェクト処理に使用）
+numpy>=1.24.0
+
+# データテーブル表示（今回のUIでは軽微に使用）
+pandas>=2.0.0

@@ -120,7 +120,10 @@ def exchange_code_for_session(code: str) -> dict:
     """GoogleログインのリダイレクトURLから受け取った code をセッションに交換する"""
     try:
         client = get_client()
-        res = client.auth.exchange_code_for_session({"auth_code": code})
+        # ★ Supabase公式Pythonリファレンスの例と同じ呼び方（{"auth_code": code}のみ）で問題ない。
+        #   ライブラリ内部の型定義(CodeExchangeParams)が実際の必須項目より厳しく書かれているだけの
+        #   誤検知のため、ここでは無視する。
+        res = client.auth.exchange_code_for_session({"auth_code": code})  # type: ignore[arg-type]
         if res.session and res.user:
             return {"success": True, "user": res.user, "session": res.session}
         return {"success": False, "error": "セッション交換に失敗しました"}

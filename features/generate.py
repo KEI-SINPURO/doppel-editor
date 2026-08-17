@@ -11,7 +11,7 @@ import tempfile
 import os
 import pathlib
 import shutil
-from typing import Optional
+from typing import Optional, Any, Dict
 
 try:
     from moviepy.editor import (
@@ -183,7 +183,10 @@ def generate_with_subtitles(
                 seg_pos_key = segment.get("position", position_key)
                 seg_pos = pos_map.get(seg_pos_key, pos)
 
-                tc_kwargs = dict(
+                # ★ 値の型が混在する(int/str/tuple/None)辞書なので、Dict[str, Any]と明示する。
+                #   これが無いと **tc_kwargs で展開した際に、各キーワード引数の型が
+                #   「あり得る全ての値の型の合体」とみなされてしまい、誤検知の原因になる。
+                tc_kwargs: Dict[str, Any] = dict(
                     fontsize=seg_size, color=seg_color,
                     stroke_color=stroke_color, stroke_width=stroke_width,
                     method="caption", size=(video.w - 80, None), align="center",

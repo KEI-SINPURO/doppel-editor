@@ -94,7 +94,8 @@ def mix_bgm(video_bytes: bytes, bgm_path: str, bgm_volume_db: float = -12.0) -> 
         bgm = AudioFileClip(bgm_path)
 
         volume_factor = 10 ** (bgm_volume_db / 20)  # dB → 倍率
-        bgm_looped = afx.audio_loop(bgm, duration=video.duration).volumex(volume_factor)
+        # audio_loop / volumex は moviepy 1.0.3 に実在するが、型スタブに未収録のため誤検知になる
+        bgm_looped = afx.audio_loop(bgm, duration=video.duration).volumex(volume_factor)  # type: ignore[attr-defined]
 
         new_audio = CompositeAudioClip([video.audio, bgm_looped]) if video.audio else bgm_looped
         final = video.set_audio(new_audio)
@@ -141,7 +142,7 @@ def insert_se(
         volume_factor = 10 ** (se_volume_db / 20)
 
         se_clips = [
-            AudioFileClip(se_path).volumex(volume_factor).set_start(t)
+            AudioFileClip(se_path).volumex(volume_factor).set_start(t)  # type: ignore[attr-defined]
             for t in timestamps if 0 <= t < video.duration
         ]
         if not se_clips:

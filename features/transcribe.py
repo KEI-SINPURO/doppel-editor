@@ -25,7 +25,10 @@ except ImportError:
 
 if _HAS_STREAMLIT and st is not None:
     @st.cache_resource(show_spinner=False)
-    def _load_whisper_model(size: str):
+    def _load_whisper_model(size: str):  # pyright: ignore[reportRedeclaration]
+        # ★ if/elseの両方でこの関数名を定義しているため、Pylanceは
+        #   「同じ名前を二重宣言している」と警告する。実際にはstreamlitの有無で
+        #   片方だけが有効になる設計なので問題ない。
         """Whisper モデルを一度だけ読み込んでキャッシュする（Streamlit環境）"""
         try:
             import whisper as _whisper  # type: ignore[import]

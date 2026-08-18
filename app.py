@@ -54,12 +54,13 @@ from ai.auth import (
     load_editors_remote, save_editor_remote, delete_editor_remote, save_feedback_remote,
 )
 from ai.model import is_ai_ready, get_thumbnail_suggestion, generate_edit_plan
+from ai.heuristic import build_heuristic_edit_plan
 from ai.learning import FeedbackLearner
 
 from features.transcribe import transcribe_video, get_plain_text, estimate_time
 from features.analyze import analyze_style, analyze_brightness
 from features.generate import auto_cut_by_segments, generate_with_subtitles, generate_srt
-from features.effects import apply_color_grade, apply_zoom_effect
+from features.effects import apply_color_grade, apply_zoom_effect, detect_highlight_moments
 from features.branding import overlay_logo, mix_bgm
 
 init_storage()
@@ -719,11 +720,14 @@ def render_reproduce_tab(editor: dict, eid: str):
             highlight_moments = plan.get("highlight_moments", [])
             ai_used = True
         else:
-            sub_segments = [
-                {"start": s["start"], "end": s["end"], "text": s["text"], "emphasis": "normal"}
-                for s in segments
-            ]
-            highlight_moments = []
+            # AIキー未設定・エラー時のフォールバック：
+            # 外部AIを一切使わず、キーワード出現・音量ベースのルールだけで
+            # 強調テロップ・ハイライト箇所を自動判定する（ai/heuristic.py）
+            progress.progress(38, text="AI未使用のため、キーワード・音量でルールベース判定中...")
+            detected_highlights = detect_highlight_moments(video_bytes, segments)
+            heuristic_plan = build_heuristic_edit_plan(segments, detected_highlights)
+            sub_segments = heuristic_plan["segments"]
+            highlight_moments = heuristic_plan["highlight_moments"]
             ai_used = False
 
         progress.progress(45, text="学習したテンポで無音をカット中...")
@@ -774,7 +778,7 @@ def render_reproduce_tab(editor: dict, eid: str):
             output = mix_bgm(output, bgm_choice["path"]) or output
 
         progress.progress(100, text="完成！")
-        ai_note = "（AIによる編集プラン適用済み）" if ai_used else "（AI未設定のため、解析ベースの再現のみ）"
+        ai_note = "（Claude AIによる編集プラン適用済み）" if ai_used else "（ルールベース判定で自動編集・外部AI不使用）"
         st.success(f"✅「{style.get('label')}」スタイルで自動編集が完了しました {ai_note}")
 
         col_before, col_after = st.columns(2)

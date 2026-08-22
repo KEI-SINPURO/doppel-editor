@@ -2,6 +2,13 @@
 features/effects.py  ―  動画エフェクト
 
 STEP2「新しい動画に再現する」で、学習済みスタイルをもとに実際に適用するエフェクト群。
+
+  apply_color_grade()       … 色調補正
+  apply_zoom_effect()       … ハイライト部分のズームイン/アウト演出
+  apply_speed_ramp()        … ハイライト部分のスロー/早送り演出（NEW）
+  auto_reframe()            … 顔検出ベースの自動リフレーム（横→縦型 等）（NEW）
+  detect_highlight_moments()… 盛り上がりシーンの自動検出（キーワード＋音量ベース）
+
 今回のスコープ（分析→再現のみ）で使わない機能（揺れ・フラッシュ・絵文字オーバーレイ等）は
 コードを読みやすくするため削除しています。必要になったら features/branding.py と
 同じ要領で追加してください。
@@ -15,7 +22,7 @@ import cv2
 import numpy as np
 
 try:
-    from moviepy.editor import VideoFileClip
+    from moviepy.editor import VideoFileClip, concatenate_videoclips, vfx
     HAS_MOVIEPY = True
 except ImportError:
     HAS_MOVIEPY = False
@@ -167,6 +174,247 @@ def apply_zoom_effect(video_bytes: bytes, zoom_points: list) -> Optional[bytes]:
 
     finally:
         for p in [tmp_path, output_path]:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+
+
+def apply_speed_ramp(video_bytes: bytes, speed_points: list, factor: float = 0.6) -> Optional[bytes]:
+    """
+    指定した時間帯だけ再生速度を変える（主にハイライト部分のスローモーション演出に使用）。
+    factor < 1.0 でスロー、factor > 1.0 で早送り。
+
+    Args:
+        video_bytes : 対象動画
+        speed_points: [{"start": float, "end": float}, ...]（動画の現在のタイムライン基準の時刻）
+        factor      : 適用する速度倍率（0.6なら6割の速さ＝ゆるやかなスロー）
+
+    【注意】moviepyの speedx は音声もそのまま速度変換するため、
+    スロー再生にすると音声のピッチも下がります（早送りだとピッチが上がります）。
+    音声のピッチを保ったまま速度だけ変えるタイムストレッチ処理は今回未対応です。
+    気になる場合は、ハイライト演出を「ズームのみ」にしてください。
+    """
+    if not HAS_MOVIEPY or not speed_points:
+        return None
+
+    tmp_path = None
+    output_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(video_bytes)
+            tmp_path = tmp.name
+
+        video = VideoFileClip(tmp_path)
+
+        # 区間の重なりを統合しておく（ハイライトが隣接・重複していても二重適用しないため）
+        raw_ranges = sorted(
+            (max(0.0, p.get("start", 0)), min(video.duration, p.get("end", 0)))
+            for p in speed_points
+        )
+        merged: list[tuple[float, float]] = []
+        for s, e in raw_ranges:
+            if e <= s:
+                continue
+            if merged and s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+
+        if not merged:
+            video.close()
+            return video_bytes
+
+        clips = []
+        cursor = 0.0
+        for s, e in merged:
+            if s > cursor:
+                clips.append(video.subclip(cursor, s))
+            clips.append(video.subclip(s, e).fx(vfx.speedx, factor))
+            cursor = e
+        if cursor < video.duration:
+            clips.append(video.subclip(cursor, video.duration))
+
+        final = concatenate_videoclips(clips, method="compose")
+        output_path = tmp_path.replace(".mp4", "_speedramp.mp4")
+        final.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None, threads=4)
+
+        with open(output_path, "rb") as f:
+            result = f.read()
+        video.close()
+        final.close()
+        return result
+
+    except Exception as e:
+        print(f"速度変化エラー: {e}")
+        return None
+
+    finally:
+        for p in [tmp_path, output_path]:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+
+
+_FACE_CASCADE = None
+_FACE_CASCADE_LOAD_FAILED = False
+
+
+def _get_face_cascade():
+    """
+    顔検出用のHaar Cascadeを読み込む（シングルトン）。
+    opencv-python にファイルが同梱されているため、追加インストール・ダウンロードは不要。
+    読み込みに失敗した場合は None を返し、呼び出し側は中央クロップにフォールバックする。
+    """
+    global _FACE_CASCADE, _FACE_CASCADE_LOAD_FAILED
+    if _FACE_CASCADE is not None:
+        return _FACE_CASCADE
+    if _FACE_CASCADE_LOAD_FAILED:
+        return None
+    try:
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"  # type: ignore[attr-defined]
+        cascade = cv2.CascadeClassifier(cascade_path)
+        if cascade.empty():
+            raise RuntimeError("cascade empty")
+        _FACE_CASCADE = cascade
+        return _FACE_CASCADE
+    except Exception as e:
+        print(f"顔検出モデルの読み込みに失敗（中央クロップにフォールバックします）: {e}")
+        _FACE_CASCADE_LOAD_FAILED = True
+        return None
+
+
+def auto_reframe(video_bytes: bytes, target_ratio: str = "9:16", smoothing: float = 0.25) -> Optional[bytes]:
+    """
+    横動画をShorts/Reels/TikTok等の縦型・スクエア比率に自動リフレームする。
+
+    OpenCVの顔検出（Haar Cascade。opencv-python同梱・追加インストール不要）を使い、
+    映っている人物を検出できたフレームではそちらにクロップ窓を寄せ、
+    検出できないフレーム（横顔・後ろ姿・ゲーム画面など）では直前の位置を維持する。
+    急に飛ばないよう、指数移動平均でクロップ位置をなめらかに追従させる。
+
+    Args:
+        video_bytes : 元動画（横向きを想定）
+        target_ratio: "9:16"（Shorts/Reels/TikTok）/ "4:5"（Instagramフィード）/ "1:1"（正方形）
+        smoothing   : 顔位置への追従の強さ(0~1)。大きいほど素早く追従するが、揺れやすくなる。
+
+    Returns:
+        リフレーム後の動画バイト列（失敗時はNone）
+
+    【注意】顔検出ベースの簡易実装のため、複数人が映るシーンやゲーム実況・アニメ調の
+    映像では狙い通りに追従しない場合があります。顔が一度も検出できない場合は、
+    中央を基準にしたクロップにフォールバックします。
+    """
+    if not HAS_MOVIEPY:
+        return None
+
+    try:
+        target_w, target_h = (float(x) for x in target_ratio.split(":"))
+    except Exception:
+        target_w, target_h = 9.0, 16.0
+
+    tmp_path = output_path = final_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(video_bytes)
+            tmp_path = tmp.name
+
+        cap = cv2.VideoCapture(tmp_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if not orig_w or not orig_h:
+            cap.release()
+            return None
+
+        orig_ratio = orig_w / orig_h
+        target_ratio_value = target_w / target_h
+
+        if abs(orig_ratio - target_ratio_value) < 0.02:
+            # すでにほぼ目的の比率なら何もしない
+            cap.release()
+            return video_bytes
+
+        face_cascade = _get_face_cascade()
+        detect_interval = max(int(fps // 3), 1)  # 1秒に約3回だけ検出（軽量化）
+
+        if target_ratio_value < orig_ratio:
+            # 横方向をクロップ（横動画→縦動画の典型パターン）
+            crop_w = max(2, int(orig_h * target_ratio_value))
+            crop_h = orig_h
+            track_horizontal = True
+        else:
+            # 縦方向をクロップ
+            crop_w = orig_w
+            crop_h = max(2, int(orig_w / target_ratio_value))
+            track_horizontal = False
+
+        output_path = tmp_path.replace(".mp4", "_reframe_noaudio.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore[attr-defined]
+        out = cv2.VideoWriter(output_path, fourcc, fps, (crop_w, crop_h))
+
+        smoothed_center = (orig_w / 2) if track_horizontal else (orig_h / 2)
+        frame_idx = 0
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if face_cascade is not None and frame_idx % detect_interval == 0:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(40, 40))
+                if len(faces) > 0:
+                    # 一番大きく映っている顔を採用する（メイン被写体とみなす）
+                    fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+                    target_center = (fx + fw / 2) if track_horizontal else (fy + fh / 2)
+                    smoothed_center = smoothed_center * (1 - smoothing) + target_center * smoothing
+
+            if track_horizontal:
+                x1 = int(max(0, min(orig_w - crop_w, smoothed_center - crop_w / 2)))
+                cropped = frame[:, x1:x1 + crop_w]
+            else:
+                y1 = int(max(0, min(orig_h - crop_h, smoothed_center - crop_h / 2)))
+                cropped = frame[y1:y1 + crop_h, :]
+
+            if cropped.shape[1] != crop_w or cropped.shape[0] != crop_h:
+                cropped = cv2.resize(cropped, (crop_w, crop_h))
+
+            out.write(cropped)
+            frame_idx += 1
+
+        cap.release()
+        out.release()
+
+        if not HAS_MOVIEPY:
+            with open(output_path, "rb") as f:
+                return f.read()
+
+        final_path = tmp_path.replace(".mp4", "_reframe.mp4")
+        original = VideoFileClip(tmp_path)
+        reframed_clip = VideoFileClip(output_path)
+        if original.audio:
+            reframed_clip = reframed_clip.set_audio(original.audio)
+
+        reframed_clip.write_videofile(final_path, codec="libx264", audio_codec="aac", logger=None, threads=4)
+
+        with open(final_path, "rb") as f:
+            result = f.read()
+
+        original.close()
+        reframed_clip.close()
+        return result
+
+    except Exception as e:
+        print(f"自動リフレームエラー: {e}")
+        return None
+
+    finally:
+        for p in [tmp_path, output_path, final_path]:
             if p and os.path.exists(p):
                 try:
                     os.unlink(p)

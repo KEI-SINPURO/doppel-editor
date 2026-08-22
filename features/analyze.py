@@ -2,18 +2,43 @@
 features/analyze.py  ―  動画スタイル分析
 
 過去に投稿した「編集済み動画」を解析して、
-  - カットの頻度・平均間隔（テンポ）
-  - テロップの色・位置
+  - カットの頻度・平均間隔・リズムパターン（テンポ）
+  - テロップの色・位置・出現密度
   - 明るさ・カラートーン（暖色系／寒色系）
 を数値として抽出する。ここで得られた値が、STEP2（新しい動画への自動再現）で
 そのまま使われる「学習済みスタイル」の中身になる。
+
+【今回追加した点】
+  analyze_cut_rhythm()      … カット間隔の「平均」だけでなく「ばらつき」を見て、
+                               一定リズム型／緩急型／不規則型のどれかを判定する。
+  analyze_editing_patterns()… 編集前(raw)と編集後(edited)の文字起こしを比較し、
+                               「その編集者がどう素材を削っているか」というカットの
+                               判断基準（残す割合・フィラー語の除去傾向・文の区切りで
+                               切る傾向など）を学習する。これがSTEP2で
+                               「単なる無音カット」ではなく「その人らしいカット」を
+                               再現するための土台になる。
+
+【注意】
+  raw/edited比較はタイムコードでの厳密なアライメントは行わず、
+  文字起こしテキストの近似マッチング（difflib）で「残された／カットされた」を
+  推定する簡易的な手法です。完全に正確ではありませんが、
+  「傾向を掴んでAIへのヒントにする」という目的には十分な精度を狙っています。
 """
 
 import cv2
 import numpy as np
 import tempfile
 import os
+import difflib
 from typing import Optional
+
+
+# 「えー」「あの」のようなフィラー語（言い淀み）。
+# editing_patterns の学習・ヒューリスティック判定の両方で使う基準リスト。
+FILLER_WORDS = [
+    "えー", "えっと", "えっとー", "あのー", "あの", "まあ", "まぁ",
+    "なんか", "そのー", "その", "うーん", "ちょっと待って",
+]
 
 
 def analyze_style(video_bytes: bytes) -> Optional[dict]:
@@ -72,9 +97,8 @@ def analyze_style(video_bytes: bytes) -> Optional[dict]:
         cap.release()
         os.unlink(tmp_path)
 
-        # カットのリズム分析
-        cut_intervals = [cut_points[i + 1] - cut_points[i] for i in range(len(cut_points) - 1)]
-        avg_cut_interval = sum(cut_intervals) / len(cut_intervals) if cut_intervals else 0
+        # カットのリズム分析（平均だけでなく、ばらつき・パターンも見る）
+        rhythm = analyze_cut_rhythm(cut_points, duration)
 
         # テロップカラー集計
         white_count = sum(1 for r in subtitle_regions if r["color"] == "白")
@@ -85,21 +109,141 @@ def analyze_style(video_bytes: bytes) -> Optional[dict]:
         positions = [r["position"] for r in subtitle_regions]
         dominant_position = max(set(positions), key=positions.count) if positions else "下部"
 
+        # テロップの出現密度（1分あたり何回テロップが検出されたか）
+        subtitle_density = round(len(subtitle_regions) / duration * 60, 1) if duration else 0
+
         return {
             "duration": round(duration, 1),
             "total_cuts": len(cut_points),
-            "avg_cut_interval": round(avg_cut_interval, 2),
+            "avg_cut_interval": rhythm["avg_interval"],
             "cut_points": cut_points,
             "dominant_color": dominant_color,
             "dominant_position": dominant_position,
             "subtitle_count": len(subtitle_regions),
             "subtitle_regions": subtitle_regions,
-            "tempo": classify_tempo(avg_cut_interval),
+            "subtitle_density": subtitle_density,
+            "tempo": classify_tempo(rhythm["avg_interval"]),
+            "rhythm": rhythm,
         }
 
     except Exception as e:
         print(f"スタイル分析エラー: {e}")
         return None
+
+
+def analyze_cut_rhythm(cut_points: list, duration: float) -> dict:
+    """
+    カット間隔の「平均」だけでなく「ばらつき（標準偏差）」を見て、
+    その編集者のカットのリズムパターンを分類する。
+
+    - 一定リズム型: メトロノームのように、ほぼ均等な間隔で刻む
+    - 緩急型      : 場面に応じてテンポを意図的に変える
+    - 不規則型    : カットのタイミングが大きくばらつく
+
+    このパターンは ai/model.py のプロンプトに渡され、
+    Claudeが編集プランを組み立てる際の「テンポ感」の参考になる。
+    """
+    intervals = [cut_points[i + 1] - cut_points[i] for i in range(len(cut_points) - 1)]
+    if not intervals:
+        return {
+            "avg_interval": 0, "std_interval": 0, "min_interval": 0,
+            "max_interval": 0, "cuts_per_minute": 0, "rhythm_pattern": "不明",
+        }
+
+    avg = sum(intervals) / len(intervals)
+    variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
+    std = variance ** 0.5
+    cuts_per_minute = (len(cut_points) / duration * 60) if duration else 0
+
+    coefficient_of_variation = (std / avg) if avg else 0
+    if coefficient_of_variation < 0.3:
+        pattern = "一定リズム型（ほぼ均等な間隔でカットする）"
+    elif coefficient_of_variation < 0.7:
+        pattern = "緩急型（場面に応じてテンポを変える）"
+    else:
+        pattern = "不規則型（カットのタイミングが大きく変化する）"
+
+    return {
+        "avg_interval": round(avg, 2),
+        "std_interval": round(std, 2),
+        "min_interval": round(min(intervals), 2),
+        "max_interval": round(max(intervals), 2),
+        "cuts_per_minute": round(cuts_per_minute, 1),
+        "rhythm_pattern": pattern,
+    }
+
+
+def analyze_editing_patterns(raw_segments: list, edited_segments: list) -> dict:
+    """
+    編集前(raw)素材と編集後(edited)動画、それぞれの文字起こしセグメントを比較し、
+    「編集者がどういう基準で発言をカットしているか」の癖を学習する。
+
+    アプローチ（完全一致のタイムライン整列は行わず、テキストベースの近似）:
+      raw の各発言セグメントについて、その内容が edited 側の文字起こし全体の
+      中にどれだけ含まれているかを difflib で調べ、「残された」か「カットされた」かを判定する。
+
+    Args:
+        raw_segments   : 編集前素材のWhisperセグメント [{"start","end","text"}, ...]
+        edited_segments: 編集後完成動画のWhisperセグメント（同上）
+
+    Returns:
+        {
+          "keep_ratio": float,             # 素材のうち時間ベースで残された割合(0~1)
+          "cut_count": int,                # カットされたセグメント数
+          "avg_cut_duration": float,       # カットされた発言1つあたりの平均秒数
+          "filler_removal_rate": float,    # フィラー語を含む発言のうち、カットされた割合
+          "boundary_tendency": float,      # カットが句読点（文の区切り）で終わる発言だった割合
+          "typical_cut_examples": [str],   # 実際にカットされた発言の例（最大5件・各40文字まで）
+        }
+        raw_segments が空の場合は {} を返す。
+    """
+    if not raw_segments:
+        return {}
+
+    edited_text_joined = "".join(s.get("text", "").strip() for s in edited_segments) if edited_segments else ""
+
+    def _is_kept(text: str) -> bool:
+        if not text:
+            return True  # 空発言は判定対象外（カット扱いしない）
+        matcher = difflib.SequenceMatcher(None, text, edited_text_joined)
+        match = matcher.find_longest_match(0, len(text), 0, len(edited_text_joined))
+        # 発言の6割以上がedited側に連続して見つかれば「残された」とみなす
+        return match.size >= max(2, int(len(text) * 0.6))
+
+    kept_flags = [_is_kept(s.get("text", "").strip()) for s in raw_segments]
+
+    total_raw_duration = sum(max(0, s.get("end", 0) - s.get("start", 0)) for s in raw_segments)
+    cut_segments = [
+        s for s, kept in zip(raw_segments, kept_flags)
+        if not kept and s.get("text", "").strip()
+    ]
+
+    cut_duration = sum(max(0, s.get("end", 0) - s.get("start", 0)) for s in cut_segments)
+    keep_ratio = 1 - (cut_duration / total_raw_duration) if total_raw_duration else 1.0
+
+    filler_total = sum(
+        1 for s in raw_segments if any(fw in s.get("text", "") for fw in FILLER_WORDS)
+    )
+    filler_cut = sum(
+        1 for s in cut_segments if any(fw in s.get("text", "") for fw in FILLER_WORDS)
+    )
+    filler_removal_rate = (filler_cut / filler_total) if filler_total else 0.0
+
+    boundary_hits = sum(
+        1 for s in cut_segments if s.get("text", "").strip().endswith(("。", "！", "？", "!", "?"))
+    )
+    boundary_tendency = (boundary_hits / len(cut_segments)) if cut_segments else 0.0
+
+    typical_cut_examples = [s.get("text", "").strip()[:40] for s in cut_segments[:5]]
+
+    return {
+        "keep_ratio": round(max(0.0, min(1.0, keep_ratio)), 2),
+        "cut_count": len(cut_segments),
+        "avg_cut_duration": round(cut_duration / len(cut_segments), 2) if cut_segments else 0,
+        "filler_removal_rate": round(filler_removal_rate, 2),
+        "boundary_tendency": round(boundary_tendency, 2),
+        "typical_cut_examples": typical_cut_examples,
+    }
 
 
 def detect_subtitle_position(frame) -> str:

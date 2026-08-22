@@ -1,11 +1,12 @@
 """
-features/branding.py  ―  個人素材（ロゴ・BGM・効果音）の適用
+features/branding.py  ―  個人素材（ロゴ・BGM・効果音・ナレーション）の適用
 
 「自分だけの素材」機能：
   - ロゴ … 動画の隅に半透明で焼き込む
   - フォント … generate.py 側で TextClip の font パスとして利用（このファイルでは扱わない）
   - BGM … 元の音声の下にループしてミックスする
   - SE  … 指定タイミング（AIが選んだハイライト等）に効果音を重ねる
+  - ナレーション（NEW） … ボイスオーバー音声を重ね、その区間だけ元の音声をダッキングする
 """
 
 import tempfile
@@ -15,7 +16,7 @@ from typing import Optional, List
 try:
     from moviepy.editor import (
         VideoFileClip, ImageClip, AudioFileClip,
-        CompositeVideoClip, CompositeAudioClip, afx,
+        CompositeVideoClip, CompositeAudioClip, concatenate_audioclips, afx,
     )
     HAS_MOVIEPY = True
 except ImportError:
@@ -162,6 +163,83 @@ def insert_se(
 
     except Exception as e:
         print(f"効果音挿入エラー: {e}")
+        return None
+    finally:
+        for p in [tmp_path, output_path]:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+
+
+def add_narration(
+    video_bytes: bytes,
+    narration_path: str,
+    start_at: float = 0.0,
+    duck_db: float = -15.0,
+) -> Optional[bytes]:
+    """
+    ナレーション（ボイスオーバー）音声を動画に重ねる。
+    ナレーションが再生されている区間だけ、元の動画の音声を duck_db だけ下げる
+    （ダッキング）ことで、ナレーションを聞き取りやすくする。
+
+    Args:
+        video_bytes    : 対象動画
+        narration_path : ナレーション音声ファイルのパス（mp3/wav等）
+        start_at        : ナレーションを開始する動画上の時刻（秒）。基本は動画冒頭(0.0)
+        duck_db         : ナレーション再生中、元の音声を何dB下げるか（負の値。例: -15.0）
+
+    Returns:
+        合成後の動画バイト列（失敗時はNone）
+    """
+    if not HAS_MOVIEPY or not narration_path or not os.path.exists(narration_path):
+        return None
+
+    tmp_path = output_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(video_bytes)
+            tmp_path = tmp.name
+
+        video = VideoFileClip(tmp_path)
+        narration = AudioFileClip(narration_path)
+
+        start_at = max(0.0, min(start_at, video.duration))
+        narration_len = min(narration.duration, video.duration - start_at)
+        if narration_len <= 0:
+            video.close()
+            narration.close()
+            return video_bytes
+
+        narration_clip = narration.subclip(0, narration_len).set_start(start_at)
+
+        if video.audio:
+            duck_factor = 10 ** (duck_db / 20)
+            segments = []
+            if start_at > 0:
+                segments.append(video.audio.subclip(0, start_at))
+            segments.append(video.audio.subclip(start_at, start_at + narration_len).volumex(duck_factor))  # type: ignore[attr-defined]
+            if start_at + narration_len < video.duration:
+                segments.append(video.audio.subclip(start_at + narration_len, video.duration))
+            ducked_original = concatenate_audioclips(segments)
+            combined_audio = CompositeAudioClip([ducked_original, narration_clip])
+        else:
+            combined_audio = narration_clip
+
+        final = video.set_audio(combined_audio)
+        output_path = tmp_path.replace(".mp4", "_narration.mp4")
+        final.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None, threads=4)
+
+        with open(output_path, "rb") as f:
+            result = f.read()
+        video.close()
+        narration.close()
+        final.close()
+        return result
+
+    except Exception as e:
+        print(f"ナレーション合成エラー: {e}")
         return None
     finally:
         for p in [tmp_path, output_path]:

@@ -11,11 +11,29 @@ app.py  ―  Doppel Editor メインアプリケーション（v2: スコープ�
     - 個人素材（ロゴ・フォント・BGM・効果音）をアップロードして動画生成に使える
     - サムネイル生成は維持
     - ログインにGoogleを追加
+    - 編集前(raw)素材と編集後(edited)動画を比較して「カットの癖」を学習し、
+      再現時のカット判断（学習した基準で残す／削る）に反映
+    - トランジション／ハイライトのスローモーション／顔検出ベースの自動リフレーム
+    - カットで詰まった分のタイムラインのズレを補正するテロップ・ハイライトの時刻変換
+    - 複数の素材動画を結合してから再現編集できる（イントロ＋本編＋アウトロ 等）
+    - ナレーション（ボイスオーバー）音声の追加とダッキング
+    - ハイライトへの効果音（SE）自動配置（組み込みプリセット／自分の素材）
+    - BGMプリセットの仕組み（assets/bgm_presets/ 参照）
+    - 【NEW】本番レンダリング前に、AIの編集プラン（テロップ文言・残す/削る・強調）を
+      確認・修正できるプレビュー画面（pipeline.py に処理を分離）
+    - 【NEW】音量正規化・簡易ノイズゲート・プラットフォーム別の書き出し設定プリセット
+    - 【NEW】複数の動画をまとめて自動編集するバッチ処理タブ（ZIP一括ダウンロード）
+
+  処理の実体（文字起こし→編集プラン作成→動画書き出し）は pipeline.py に切り出してあり、
+  「動画を再現する」タブとバッチ処理タブの両方から共通で使っている。
 """
 
 import streamlit as st
 import sys
 import os
+import tempfile
+import zipfile
+import io
 
 st.set_page_config(
     page_title="Doppel Editor",
@@ -40,6 +58,8 @@ except Exception:
 from dotenv import load_dotenv
 load_dotenv()
 
+import pandas as pd
+
 from ui.theme import get_css, THEMES, get_theme as _get_theme
 from ui.components import svg, get_genre_icon, ICON_CHOICES, render_section_title, render_alert, run_ai_with_progress
 
@@ -53,15 +73,17 @@ from ai.auth import (
     sign_up, sign_in, sign_out, sign_in_with_google, exchange_code_for_session,
     load_editors_remote, save_editor_remote, delete_editor_remote, save_feedback_remote,
 )
-from ai.model import is_ai_ready, get_thumbnail_suggestion, generate_edit_plan
-from ai.heuristic import build_heuristic_edit_plan
+from ai.model import is_ai_ready, get_thumbnail_suggestion
 from ai.learning import FeedbackLearner
 
 from features.transcribe import transcribe_video, get_plain_text, estimate_time
-from features.analyze import analyze_style, analyze_brightness
-from features.generate import auto_cut_by_segments, generate_with_subtitles, generate_srt
-from features.effects import apply_color_grade, apply_zoom_effect, detect_highlight_moments
-from features.branding import overlay_logo, mix_bgm
+from features.analyze import analyze_style, analyze_brightness, analyze_editing_patterns
+from features.generate import concatenate_source_clips
+from features.se_presets import list_se_preset_names, get_se_preset_bytes
+from features.media_library import list_bgm_presets
+from features.export_presets import list_export_preset_names, get_export_preset
+
+from pipeline import build_edit_plan, render_final_video, derive_highlights_from_plan
 
 init_storage()
 
@@ -100,6 +122,192 @@ def _sync_editor(eid: str):
         e = get_editor(eid)
         if e:
             save_editor_remote(e, str(u.id), s.access_token)
+
+
+# ============================================================
+# 演出オプションUI・レンダリング設定の組み立て（再現タブ・バッチタブ共通）
+# ============================================================
+def render_options_ui(assets: dict, key_prefix: str):
+    """
+    「自分の素材を使う」「演出オプション」「追加の音素材」「音質仕上げ・書き出し設定」の
+    UIをまとめて描画し、pipeline.render_final_video() にそのまま渡せる render_options を返す。
+    「動画を再現する」タブとバッチ処理タブの両方から呼べるよう、key_prefixでウィジェットキーを分離する。
+
+    Returns:
+        (render_options: dict, labels: dict)
+        render_options の "se_source" と "narration_file" は、まだファイル化されていない
+        （SEプリセット名 or アップロードされたファイルオブジェクトのまま）。
+        実際に書き出す直前に _materialize_render_options() で一時ファイルに変換する。
+    """
+    bgm_presets = list_bgm_presets()
+    bgm_label_to_path = {"使わない": None}
+    for p in bgm_presets:
+        bgm_label_to_path[f"🎼 プリセット: {p['label']}"] = p["path"]
+    for b in assets.get("bgm", []):
+        bgm_label_to_path[f"📁 自分の素材: {b['label']}"] = b["path"]
+
+    se_label_to_source = {"なし": None}
+    for name in list_se_preset_names():
+        se_label_to_source[f"🎛️ プリセット: {name}"] = ("preset", name)
+    for se in assets.get("se", []):
+        se_label_to_source[f"📁 自分の素材: {se['label']}"] = ("asset", se["path"])
+
+    transition_options = {
+        "カット（トランジションなし）": "cut",
+        "クロスフェード（ディゾルブ）": "crossfade",
+        "暗転（黒に落としてつなぐ）": "fade_black",
+        "学習したリズムにおまかせ": "auto",
+    }
+    highlight_fx_options = {
+        "ズーム": "zoom", "なし": "none",
+        "スローモーション": "slowmo", "ズーム＋スローモーション": "zoom_slowmo",
+    }
+    reframe_options = {
+        "変更しない（元の比率のまま）": None,
+        "縦型 9:16（Shorts / Reels / TikTok）": "9:16",
+        "スクエア 1:1（Instagramフィード）": "1:1",
+        "縦長 4:5（Instagramフィード）": "4:5",
+    }
+    export_preset_names = list_export_preset_names()
+
+    use_logo = False
+    use_font = False
+    with st.expander("自分の素材を使う（任意）", expanded=False):
+        if assets.get("logo"):
+            use_logo = st.checkbox(f"ロゴを焼き込む（{assets['logo']['filename']}）", key=f"{key_prefix}_use_logo")
+        else:
+            st.caption("ロゴは「自分の素材」タブから追加できます")
+        font_asset = assets.get("font")
+        if font_asset:
+            use_font = st.checkbox(
+                f"テロップに自分のフォントを使う（{font_asset['filename']}）", key=f"{key_prefix}_use_font",
+            )
+
+    with st.expander("演出オプション（任意）", expanded=False):
+        transition_choice_label = st.selectbox(
+            "カットのつなぎ方（トランジション）", list(transition_options.keys()),
+            index=0, key=f"{key_prefix}_transition",
+        )
+        transition_choice = transition_options[transition_choice_label]
+
+        highlight_fx_choice_label = st.selectbox(
+            "ハイライト演出", list(highlight_fx_options.keys()), index=0, key=f"{key_prefix}_highlight_fx",
+        )
+        highlight_fx = highlight_fx_options[highlight_fx_choice_label]
+        if highlight_fx in ("slowmo", "zoom_slowmo"):
+            st.caption("※ スローモーションは音声のピッチも下がります（音程補正は未対応）")
+
+        reframe_choice_label = st.selectbox(
+            "画面比率（自動リフレーム）", list(reframe_options.keys()), index=0, key=f"{key_prefix}_reframe",
+        )
+        reframe_ratio = reframe_options[reframe_choice_label]
+        if reframe_ratio:
+            st.caption("※ 顔検出でメインの被写体を追従してクロップします（うまく検出できない場合は中央クロップ）")
+
+    with st.expander("追加の音素材（任意）", expanded=False):
+        st.caption("🎙️ ナレーション（ボイスオーバー） ― 動画冒頭から重ね、その間だけ元の音声を下げます")
+        up_narration = st.file_uploader(
+            "ナレーション音声", type=["mp3", "wav", "m4a"], key=f"{key_prefix}_narration",
+        )
+        narration_duck_db = st.slider(
+            "ナレーション再生中、元の音量をどれだけ下げるか（dB）", 0, 30, 15, key=f"{key_prefix}_duck",
+        )
+
+        st.caption("🔊 ハイライト効果音 ― 盛り上がりシーンに自動で配置します")
+        if len(se_label_to_source) == 1:
+            st.caption("（自分のSEを追加するには「自分の素材」タブから登録してください）")
+        se_choice_label = st.selectbox("効果音", list(se_label_to_source.keys()), index=0, key=f"{key_prefix}_se")
+        se_source = se_label_to_source[se_choice_label]
+
+        st.caption("🎼 BGM ― プリセット、または自分の素材から選べます")
+        if len(bgm_label_to_path) == 1:
+            st.caption("プリセットBGMは未登録です（assets/bgm_presets/ 参照）。「自分の素材」タブからも追加できます。")
+        bgm_choice_label = st.selectbox("BGM", list(bgm_label_to_path.keys()), index=0, key=f"{key_prefix}_bgm")
+        bgm_path_choice = bgm_label_to_path[bgm_choice_label]
+
+    with st.expander("音質仕上げ・書き出し設定（任意）", expanded=False):
+        normalize_audio = st.checkbox(
+            "音量を正規化する（動画全体の音量を適正なレベルに合わせる）", key=f"{key_prefix}_normalize",
+        )
+        noise_gate = st.checkbox(
+            "簡易ノイズゲートをかける（無音区間の残留ノイズを抑える）", key=f"{key_prefix}_noisegate",
+        )
+        st.caption("※ どちらも簡易的な処理です。環境音そのものを消すような本格的なノイズ除去はできません。")
+        export_preset_label = st.selectbox(
+            "書き出し設定", export_preset_names, index=0, key=f"{key_prefix}_export",
+        )
+
+    render_options = {
+        "transition": transition_choice,
+        "highlight_fx": highlight_fx,
+        "reframe_ratio": reframe_ratio,
+        "use_logo": use_logo,
+        "logo_path": (assets.get("logo") or {}).get("path") if use_logo else None,
+        "use_font": use_font,
+        "font_path": (assets.get("font") or {}).get("path") if use_font else None,
+        "bgm_path": bgm_path_choice,
+        "se_source": se_source,          # ("preset", name) | ("asset", path) | None
+        "narration_file": up_narration,  # UploadedFile | None
+        "narration_duck_db": narration_duck_db,
+        "normalize_audio": normalize_audio,
+        "noise_gate": noise_gate,
+        "export_preset": get_export_preset(export_preset_label),
+    }
+    labels = {
+        "transition": transition_choice_label if transition_choice != "cut" else None,
+        "highlight_fx": highlight_fx_choice_label if highlight_fx != "none" else None,
+        "reframe": reframe_choice_label if reframe_ratio else None,
+        "se": se_choice_label if se_source else None,
+        "bgm": bgm_choice_label if bgm_path_choice else None,
+        "narration": "ナレーション追加" if up_narration else None,
+        "normalize_audio": "音量正規化" if normalize_audio else None,
+        "noise_gate": "ノイズゲート" if noise_gate else None,
+        "export_preset": export_preset_label,
+    }
+    return render_options, labels
+
+
+def _materialize_render_options(render_options: dict):
+    """
+    render_options_ui() が返した dict のうち、まだファイル化されていないもの
+    （SEプリセット名・アップロードされたナレーションファイル）を一時ファイルに書き出し、
+    pipeline.render_final_video() にそのまま渡せる形（se_path/narration_path）に変換する。
+
+    Returns:
+        (materialized_options: dict, temp_paths_to_cleanup: list[str])
+        呼び出し側は render_final_video() の呼び出し後、必ず temp_paths_to_cleanup を削除すること。
+    """
+    materialized = dict(render_options)
+    temp_paths = []
+
+    se_source = render_options.get("se_source")
+    se_path = None
+    if se_source:
+        kind, value = se_source
+        if kind == "preset":
+            se_bytes = get_se_preset_bytes(value)
+            if se_bytes:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as sf:
+                    sf.write(se_bytes)
+                    se_path = sf.name
+                temp_paths.append(se_path)
+        else:
+            se_path = value
+    materialized["se_path"] = se_path
+    materialized.pop("se_source", None)
+
+    narration_file = render_options.get("narration_file")
+    narration_path = None
+    if narration_file:
+        suffix = os.path.splitext(narration_file.name)[1] or ".mp3"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as nf:
+            nf.write(narration_file.getvalue())
+            narration_path = nf.name
+        temp_paths.append(narration_path)
+    materialized["narration_path"] = narration_path
+    materialized.pop("narration_file", None)
+
+    return materialized, temp_paths
 
 
 # ============================================================
@@ -551,17 +759,22 @@ def render_editor_detail():
         </div>
         """, unsafe_allow_html=True)
 
-    tabs = st.tabs(["🧠 スタイルを学習する", "🎬 動画を再現する", "🖼️ サムネイル", "🎨 自分の素材", "⚙️ 設定"])
+    tabs = st.tabs([
+        "🧠 スタイルを学習する", "🎬 動画を再現する", "📦 バッチ処理",
+        "🖼️ サムネイル", "🎨 自分の素材", "⚙️ 設定",
+    ])
 
     with tabs[0]:
         render_learn_tab(editor, eid)
     with tabs[1]:
         render_reproduce_tab(editor, eid)
     with tabs[2]:
-        render_thumbnail_tab(editor, eid)
+        render_batch_tab(editor, eid)
     with tabs[3]:
-        render_assets_tab(editor, eid)
+        render_thumbnail_tab(editor, eid)
     with tabs[4]:
+        render_assets_tab(editor, eid)
+    with tabs[5]:
         render_editor_settings_tab(editor, eid)
 
 
@@ -579,6 +792,20 @@ def render_learn_tab(editor: dict, eid: str):
             c1.metric("テンポ", sd.get("tempo", "未分析"))
             c2.metric("テロップ色", sd.get("dominant_color", "未分析"))
             c3.metric("カット数", str(sd.get("total_cuts", "未分析")))
+
+            rhythm = sd.get("rhythm")
+            if rhythm and rhythm.get("rhythm_pattern") and rhythm.get("rhythm_pattern") != "不明":
+                st.caption(f"⏱️ リズム傾向：{rhythm.get('rhythm_pattern')}")
+
+            patterns = sd.get("editing_patterns")
+            if patterns:
+                st.caption(
+                    f"🎯 学習した編集の癖：素材の約{int(patterns.get('keep_ratio', 1) * 100)}%を残す／"
+                    f"フィラー語除去率 約{int(patterns.get('filler_removal_rate', 0) * 100)}%／"
+                    f"カットは文の区切りで行われる傾向 約{int(patterns.get('boundary_tendency', 0) * 100)}%"
+                )
+            else:
+                st.caption("💡 「編集前の素材動画」も一緒にアップロードすると、カットの癖まで学習できます")
 
             new_label = st.text_input("名前を変更", value=s.get("label", ""), key=f"rename_{sid}") or s.get("label", "")
             cb1, cb2 = st.columns(2)
@@ -617,7 +844,7 @@ def render_learn_tab(editor: dict, eid: str):
 
     col_raw, col_edit = st.columns(2)
     with col_raw:
-        st.caption("① 編集前の素材動画（任意・比較すると精度が上がります）")
+        st.caption("① 編集前の素材動画（任意・比較すると「カットの癖」まで学習できます）")
         up_raw = st.file_uploader("素材動画", type=["mp4", "mov", "avi", "mkv", "webm"], key="learn_raw")
     with col_edit:
         st.caption("② 編集後の完成動画（必須）")
@@ -627,13 +854,34 @@ def render_learn_tab(editor: dict, eid: str):
         with st.spinner("動画を解析中..."):
             style_data = analyze_style(up_edit.getvalue())
             brightness = analyze_brightness(up_edit.getvalue())
+
+            editing_patterns = None
+            if up_raw and style_data:
+                st.caption("編集前素材と比較して「カットの癖」も学習しています…（少し時間がかかります）")
+                # 同じ動画をもう一度アップロードしなくて済むよう、raw/edited 双方をここで
+                # 一度だけ文字起こしし、「どこが残されて、どこが削られたか」を比較する。
+                raw_result = transcribe_video(up_raw.getvalue(), language="ja", model_size="tiny")
+                edited_result = transcribe_video(up_edit.getvalue(), language="ja", model_size="tiny")
+                if raw_result and edited_result:
+                    editing_patterns = analyze_editing_patterns(
+                        raw_result["segments"], edited_result["segments"],
+                    )
+                    if editing_patterns:
+                        style_data["editing_patterns"] = editing_patterns
+
         if style_data:
             save_style_data(eid, target_sid, style_data, brightness)
             add_video_to_style(eid, target_sid, {
                 "title": up_edit.name, "with_raw": up_raw.name if up_raw else None,
             })
             _sync_editor(eid)
-            st.success("学習が完了しました！「動画を再現する」タブで使えます。")
+            msg = "学習が完了しました！「動画を再現する」タブで使えます。"
+            if editing_patterns:
+                msg += (
+                    f"（素材の約{int(editing_patterns.get('keep_ratio', 1) * 100)}%を残す傾向、"
+                    f"フィラー語除去率 約{int(editing_patterns.get('filler_removal_rate', 0) * 100)}% を学習しました）"
+                )
+            st.success(msg)
             st.rerun()
         else:
             st.error("動画の解析に失敗しました。ファイル形式をご確認ください。")
@@ -660,7 +908,7 @@ def render_reproduce_tab(editor: dict, eid: str):
         format_func=lambda k: learned[k].get("label", k), key="reproduce_style_sel",
     )
     if not selected_sid:
-        return  # learned が空でない時点で通常は起こらないが、型を明示するためのガード
+        return
     style = learned[selected_sid]
     style_data = style.get("style_data", {})
 
@@ -670,116 +918,151 @@ def render_reproduce_tab(editor: dict, eid: str):
     c3.metric("カット数", style_data.get("total_cuts", "不明"))
 
     st.markdown("<br>", unsafe_allow_html=True)
-    up = st.file_uploader("新しい素材動画（未編集）をアップロード", type=["mp4", "mov", "avi", "mkv", "webm"],
-                           key="reproduce_upload")
-
-    assets = editor.get("assets", {})
-    use_logo, bgm_choice = False, None
-    with st.expander("自分の素材を使う（任意）", expanded=False):
-        if assets.get("logo"):
-            use_logo = st.checkbox(f"ロゴを焼き込む（{assets['logo']['filename']}）", key="use_logo")
-        else:
-            st.caption("ロゴは「自分の素材」タブから追加できます")
-
-        bgm_list = assets.get("bgm", [])
-        if bgm_list:
-            bgm_labels = ["使わない"] + [b["label"] for b in bgm_list]
-            bgm_sel = st.selectbox("BGM", bgm_labels, key="use_bgm")
-            if bgm_sel != "使わない":
-                bgm_choice = next(b for b in bgm_list if b["label"] == bgm_sel)
-        else:
-            st.caption("BGMは「自分の素材」タブから追加できます")
-
-        font_asset = assets.get("font")
-        use_font = st.checkbox(f"テロップに自分のフォントを使う（{font_asset['filename']}）", key="use_font") \
-            if font_asset else False
-
-    if not up:
+    ups = st.file_uploader(
+        "新しい素材動画（未編集）をアップロード（複数選択で1本に結合できます）",
+        type=["mp4", "mov", "avi", "mkv", "webm"], key="reproduce_upload", accept_multiple_files=True,
+    )
+    if not ups:
         return
 
-    if st.button("🎬 このスタイルで自動編集する", type="primary", use_container_width=True, key="run_reproduce"):
-        video_bytes = up.getvalue()
-        progress = st.progress(0, text="準備中...")
+    if len(ups) > 1:
+        st.caption(f"📎 {len(ups)}個の素材が選択されました。つなげる順番を指定してください。")
+        order_map = {}
+        order_cols = st.columns(min(len(ups), 4))
+        for idx, f in enumerate(ups):
+            with order_cols[idx % len(order_cols)]:
+                order_map[idx] = st.number_input(
+                    f"順番：{f.name[:18]}", min_value=1, max_value=len(ups), value=idx + 1,
+                    key=f"order_{idx}_{f.name}",
+                )
+        ordered_files = [f for _, f in sorted(zip((order_map[i] for i in range(len(ups))), ups), key=lambda p: p[0])]
+        combined_label = f"{ordered_files[0].name}ほか{len(ordered_files)}本を結合"
+    else:
+        ordered_files = ups
+        combined_label = ups[0].name
 
-        progress.progress(10, text="音声を文字起こし中...")
-        # Streamlit Community Cloud（無料枠・約1GBメモリ）でも安定して動くよう
-        # 既定は軽量な "tiny" にしている。Render/VPS等に移行したら "base" に上げると精度が上がる。
-        result = transcribe_video(video_bytes, language="ja", model_size="tiny")
-        if not result:
+    assets = editor.get("assets", {})
+    render_options, labels = render_options_ui(assets, key_prefix="rep")
+
+    # ── ① 編集プランの作成 ──────────────────────────────
+    render_section_title("編集プランを作成する", theme_name)
+    plan_key = f"edit_plan__{eid}__{selected_sid}"
+    video_key = f"edit_plan_video__{eid}__{selected_sid}"
+    label_key = f"edit_plan_label__{eid}__{selected_sid}"
+
+    col_plan, col_reset = st.columns([3, 1])
+    with col_plan:
+        make_plan_clicked = st.button(
+            "🧠 編集プランを作成する（文字起こし・AI判断）", type="primary",
+            use_container_width=True, key="make_plan_btn",
+        )
+    with col_reset:
+        if st.session_state.get(plan_key) is not None:
+            if st.button("↺ 作り直す", use_container_width=True, key="reset_plan_btn"):
+                st.session_state[plan_key] = None
+                st.session_state[video_key] = None
+                st.rerun()
+
+    if make_plan_clicked:
+        with st.spinner("素材を準備・文字起こし中..."):
+            if len(ordered_files) > 1:
+                video_bytes = concatenate_source_clips([f.getvalue() for f in ordered_files])
+            else:
+                video_bytes = ordered_files[0].getvalue()
+            if not video_bytes:
+                st.error("素材の結合に失敗しました。ファイル形式をご確認ください。")
+                return
+            learner = FeedbackLearner(eid)
+            reinforcement = learner.build_reinforcement_prompt()
+            plan = build_edit_plan(video_bytes, style_data, style.get("label", ""), reinforcement)
+        if not plan:
             st.error("文字起こしに失敗しました。動画ファイルをご確認ください。")
             return
-        segments = result["segments"]
+        st.session_state[plan_key] = plan
+        st.session_state[video_key] = video_bytes
+        st.session_state[label_key] = combined_label
+        st.rerun()
 
-        progress.progress(30, text="AIがあなたのスタイルで編集プランを作成中...")
-        learner = FeedbackLearner(eid)
-        reinforcement = learner.build_reinforcement_prompt()
-        plan = generate_edit_plan(segments, style_data, style.get("label", ""), reinforcement)
+    plan = st.session_state.get(plan_key)
+    video_bytes = st.session_state.get(video_key)
+    if not plan or video_bytes is None:
+        st.info("👆 「編集プランを作成する」を押すと、AIが判断したテロップ内容・残す/削るを"
+                "ここで確認・修正してから最終レンダリングに進めます。")
+        return
 
-        if plan and plan.get("segments"):
-            sub_segments = plan["segments"]
-            highlight_moments = plan.get("highlight_moments", [])
-            ai_used = True
-        else:
-            # AIキー未設定・エラー時のフォールバック：
-            # 外部AIを一切使わず、キーワード出現・音量ベースのルールだけで
-            # 強調テロップ・ハイライト箇所を自動判定する（ai/heuristic.py）
-            progress.progress(38, text="AI未使用のため、キーワード・音量でルールベース判定中...")
-            detected_highlights = detect_highlight_moments(video_bytes, segments)
-            heuristic_plan = build_heuristic_edit_plan(segments, detected_highlights)
-            sub_segments = heuristic_plan["segments"]
-            highlight_moments = heuristic_plan["highlight_moments"]
-            ai_used = False
+    ai_note = "Claude AIによる編集プラン" if plan["ai_used"] else "ルールベース判定（AI未使用）"
+    st.success(f"編集プランができました（{ai_note}）。内容を確認・修正してから最終レンダリングしてください。")
+    if plan.get("notes"):
+        st.caption(f"📝 {plan['notes']}")
 
-        progress.progress(45, text="学習したテンポで無音をカット中...")
-        cut_video = auto_cut_by_segments(video_bytes, segments) or video_bytes
-
-        progress.progress(60, text="学習したテロップスタイルで焼き込み中...")
-        base_color = style_data.get("dominant_color", "white")
-        emphasis_color = {"white": "yellow", "yellow": "red"}.get(base_color, "yellow")
-        styled_segments = []
-        for seg in sub_segments:
-            is_high = seg.get("emphasis") == "high"
-            styled_segments.append({
-                **seg,
-                "font_color": emphasis_color if is_high else base_color,
-                "font_size": 56 if is_high else 40,
-                "position": style_data.get("dominant_position", "下部"),
-            })
-
-        subtitle_style = {
-            "font_color": base_color,
-            "font_size": 40,
-            "position": style_data.get("dominant_position", "下部"),
-            "animation": "フェードイン",
-            "stroke": True,
+    # ── ② プランの確認・修正 ────────────────────────────
+    render_section_title("編集プランを確認・修正する", theme_name)
+    plan_segments = plan["plan_segments"]
+    df = pd.DataFrame([
+        {
+            "開始(秒)": round(s.get("start", 0), 1),
+            "終了(秒)": round(s.get("end", 0), 1),
+            "テロップ文言": s.get("text", ""),
+            "残す": bool(s.get("keep", True)),
+            "強調": s.get("emphasis") == "high",
         }
-        if use_font and assets.get("font"):
-            subtitle_style["font_path"] = assets["font"]["path"]
+        for s in plan_segments
+    ])
+    edited_df = st.data_editor(
+        df, key="plan_editor", use_container_width=True, num_rows="fixed", hide_index=True,
+        column_config={
+            "開始(秒)": st.column_config.NumberColumn(disabled=True),
+            "終了(秒)": st.column_config.NumberColumn(disabled=True),
+            "テロップ文言": st.column_config.TextColumn(width="large"),
+            "残す": st.column_config.CheckboxColumn(help="オフにするとその発言はカットされます"),
+            "強調": st.column_config.CheckboxColumn(help="オンにすると強調テロップ＋ハイライト演出の対象になります"),
+        },
+    )
+    st.caption(f"合計 {len(plan_segments)} 発言 ／ 残す: {int(edited_df['残す'].sum())} ／ "
+               f"強調: {int(edited_df['強調'].sum())}")
 
-        output, _ = generate_with_subtitles(cut_video, styled_segments, subtitle_style)
-        output = output or cut_video
+    # ── ③ 最終レンダリング ──────────────────────────────
+    if st.button("✅ この内容で最終レンダリングする", type="primary", use_container_width=True, key="render_final_btn"):
+        updated_plan_segments = []
+        for i, row in edited_df.iterrows():
+            original = plan_segments[i]
+            updated_plan_segments.append({
+                **original,
+                "text": row["テロップ文言"],
+                "keep": bool(row["残す"]),
+                "emphasis": "high" if bool(row["強調"]) else "normal",
+            })
+        working_plan = {
+            **plan,
+            "plan_segments": updated_plan_segments,
+            "highlight_moments": derive_highlights_from_plan(updated_plan_segments),
+        }
 
-        progress.progress(78, text="学習した色調に補正中...")
-        tone = style.get("brightness_data", {}).get("color_tone", "ニュートラル")
-        grade_style = {"暖色系": "warm", "寒色系": "cool"}.get(tone)
-        if grade_style:
-            output = apply_color_grade(output, grade_style) or output
+        materialized_options, temp_paths = _materialize_render_options(render_options)
+        progress = st.progress(0, text="準備中...")
+        try:
+            result = render_final_video(
+                video_bytes, working_plan, style, materialized_options,
+                progress_cb=lambda p, txt: progress.progress(p, text=txt),
+            )
+        finally:
+            for p in temp_paths:
+                if p and os.path.exists(p):
+                    os.unlink(p)
 
-        if highlight_moments:
-            progress.progress(86, text="盛り上がりシーンにズーム演出を追加中...")
-            zoom_points = [{"start": h["start"], "end": h["end"]} for h in highlight_moments[:5]]
-            output = apply_zoom_effect(output, zoom_points) or output
+        output = result.get("output")
+        if not output:
+            st.error("最終レンダリングに失敗しました。")
+            return
 
-        if use_logo and assets.get("logo"):
-            progress.progress(92, text="ロゴを焼き込み中...")
-            output = overlay_logo(output, assets["logo"]["path"]) or output
-        if bgm_choice:
-            progress.progress(97, text="BGMをミックス中...")
-            output = mix_bgm(output, bgm_choice["path"]) or output
+        ai_note2 = "（Claude AIによる編集プラン適用済み）" if result["ai_used"] else "（ルールベース判定で自動編集・外部AI不使用）"
+        st.success(f"✅「{style.get('label')}」スタイルで自動編集が完了しました {ai_note2}")
 
-        progress.progress(100, text="完成！")
-        ai_note = "（Claude AIによる編集プラン適用済み）" if ai_used else "（ルールベース判定で自動編集・外部AI不使用）"
-        st.success(f"✅「{style.get('label')}」スタイルで自動編集が完了しました {ai_note}")
+        applied_notes = [v for v in labels.values() if v]
+        if len(ordered_files) > 1:
+            applied_notes.insert(0, f"素材結合: {len(ordered_files)}本")
+        if applied_notes:
+            st.caption("🎛️ " + " ／ ".join(applied_notes))
 
         col_before, col_after = st.columns(2)
         with col_before:
@@ -789,23 +1072,22 @@ def render_reproduce_tab(editor: dict, eid: str):
             st.caption("After（自動編集後）")
             st.video(output)
 
-        base_name = up.name.rsplit(".", 1)[0]
+        combined_label_final = st.session_state.get(label_key, "output")
+        base_name = combined_label_final.rsplit(".", 1)[0] if "." in combined_label_final else combined_label_final
         st.download_button("⬇️ 完成動画をダウンロード", data=output,
-                            file_name=f"{base_name}_doppel.mp4", mime="video/mp4",
-                            use_container_width=True)
-
-        srt = generate_srt(sub_segments)
-        st.download_button("📄 字幕ファイル (.srt) もダウンロード", data=srt.encode("utf-8"),
+                            file_name=f"{base_name}_doppel.mp4", mime="video/mp4", use_container_width=True)
+        st.download_button("📄 字幕ファイル (.srt) もダウンロード", data=result["srt"].encode("utf-8"),
                             file_name=f"{base_name}.srt", mime="text/plain", use_container_width=True)
 
-        add_video_to_style(eid, selected_sid, {"title": up.name, "type": "reproduced"})
+        add_video_to_style(eid, selected_sid, {"title": combined_label_final, "type": "reproduced"})
 
         st.markdown("<br>", unsafe_allow_html=True)
         fb = st.radio("この自動編集の仕上がりはどうでしたか？", ["良い", "改善が必要"], key="reproduce_fb", horizontal=True)
         if st.button("フィードバックを送る", key="reproduce_fb_btn"):
+            learner = FeedbackLearner(eid)
             learner.save(
-                query=up.name,
-                response=(plan.get("notes", "") if plan else ""),
+                query=combined_label_final,
+                response=plan.get("notes", ""),
                 rating=1 if fb == "良い" else -1,
                 style_label=style.get("label", ""),
             )
@@ -817,7 +1099,96 @@ def render_reproduce_tab(editor: dict, eid: str):
             st.success("記録しました。次回の自動編集に活かされます。")
 
 
-# ── タブ3: サムネイル ────────────────────────────────────────────────────
+# ── タブ3: バッチ処理（複数動画をまとめて自動編集） ─────────────────────
+def render_batch_tab(editor: dict, eid: str):
+    theme_name = get_theme_name()
+    render_section_title("複数の動画をまとめて自動編集する", theme_name)
+    st.caption("同じスタイル・同じ設定で、複数の動画を順番に自動編集します。"
+               "1本ずつの確認・修正はできないため、まずは「動画を再現する」タブで設定を試してから使うのがおすすめです。")
+
+    styles = editor.get("styles", {})
+    learned = {sid: s for sid, s in styles.items() if s.get("style_data")}
+    if not learned:
+        st.info("まだ学習済みのスタイルがありません。")
+        return
+
+    selected_sid = st.selectbox(
+        "使用するスタイル", list(learned.keys()),
+        format_func=lambda k: learned[k].get("label", k), key="batch_style_sel",
+    )
+    if not selected_sid:
+        return
+    style = learned[selected_sid]
+    style_data = style.get("style_data", {})
+
+    batch_files = st.file_uploader(
+        "処理したい動画をまとめて選択（各ファイルが個別に自動編集されます）",
+        type=["mp4", "mov", "avi", "mkv", "webm"], accept_multiple_files=True, key="batch_upload",
+    )
+    if not batch_files:
+        return
+    st.caption(f"📦 {len(batch_files)}本の動画が選択されています。")
+
+    assets = editor.get("assets", {})
+    render_options, labels = render_options_ui(assets, key_prefix="batch")
+
+    st.warning("⏱️ 動画1本あたり数分かかる処理を、選んだ本数ぶん繰り返します。処理中はページを閉じないでください。")
+
+    if st.button(f"📦 {len(batch_files)}本をまとめて自動編集する", type="primary",
+                 use_container_width=True, key="run_batch_btn"):
+        learner = FeedbackLearner(eid)
+        reinforcement = learner.build_reinforcement_prompt()
+        results = []
+        overall = st.progress(0, text="バッチ処理を開始します...")
+
+        for i, f in enumerate(batch_files):
+            st.markdown(f"**{i + 1}/{len(batch_files)}：{f.name}**")
+            sub_progress = st.progress(0, text="準備中...")
+            video_bytes = f.getvalue()
+
+            plan = build_edit_plan(video_bytes, style_data, style.get("label", ""), reinforcement)
+            if not plan:
+                st.warning(f"⚠️ {f.name}: 文字起こしに失敗したためスキップしました")
+                overall.progress(int((i + 1) / len(batch_files) * 100), text=f"{i + 1}/{len(batch_files)} 処理済み")
+                continue
+
+            materialized_options, temp_paths = _materialize_render_options(render_options)
+            try:
+                result = render_final_video(
+                    video_bytes, plan, style, materialized_options,
+                    progress_cb=lambda p, txt, sp=sub_progress: sp.progress(p, text=txt),
+                )
+            finally:
+                for p in temp_paths:
+                    if p and os.path.exists(p):
+                        os.unlink(p)
+
+            if result.get("output"):
+                results.append({"name": f.name, "output": result["output"], "srt": result["srt"]})
+            else:
+                st.warning(f"⚠️ {f.name}: 書き出しに失敗しました")
+
+            overall.progress(int((i + 1) / len(batch_files) * 100), text=f"{i + 1}/{len(batch_files)} 処理済み")
+
+        if results:
+            st.success(f"✅ {len(results)}/{len(batch_files)}本の自動編集が完了しました")
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for r in results:
+                    base = r["name"].rsplit(".", 1)[0] if "." in r["name"] else r["name"]
+                    zf.writestr(f"{base}_doppel.mp4", r["output"])
+                    zf.writestr(f"{base}.srt", r["srt"])
+            st.download_button("⬇️ すべてまとめてダウンロード（ZIP）", data=zip_buf.getvalue(),
+                                file_name="doppel_batch_output.zip", mime="application/zip",
+                                use_container_width=True)
+            for r in results:
+                with st.expander(f"🎬 {r['name']}", expanded=False):
+                    st.video(r["output"])
+        else:
+            st.error("すべての動画で処理に失敗しました。")
+
+
+# ── タブ4: サムネイル ────────────────────────────────────────────────────
 def render_thumbnail_tab(editor: dict, eid: str):
     theme_name = get_theme_name()
     t = _get_theme(theme_name)
@@ -859,11 +1230,12 @@ def render_thumbnail_tab(editor: dict, eid: str):
         """, unsafe_allow_html=True)
 
 
-# ── タブ4: 自分の素材 ────────────────────────────────────────────────────
+# ── タブ5: 自分の素材 ────────────────────────────────────────────────────
 def render_assets_tab(editor: dict, eid: str):
     theme_name = get_theme_name()
     render_section_title("自分だけの素材（ロゴ・フォント・BGM・効果音）", theme_name)
-    st.caption("ここでアップロードした素材は「動画を再現する」タブで自動編集の仕上げに使えます")
+    st.caption("ここでアップロードした素材は「動画を再現する」タブで自動編集の仕上げに使えます。"
+               "BGM・効果音は、アプリ内蔵のプリセットと合わせて選べます。")
     assets = load_assets(eid)
 
     st.markdown("**🖼️ ロゴ**")
@@ -890,7 +1262,7 @@ def render_assets_tab(editor: dict, eid: str):
         save_asset(eid, "font", up_font.getvalue(), up_font.name)
         st.rerun()
 
-    st.markdown("<br>**🎵 BGM**", unsafe_allow_html=True)
+    st.markdown("<br>**🎵 BGM**（アプリ内蔵のプリセットBGMは「動画を再現する」タブで別途選べます）", unsafe_allow_html=True)
     for b in assets.get("bgm", []):
         c1, c2 = st.columns([4, 1])
         c1.write(f"🎵 {b['label']}")
@@ -903,7 +1275,7 @@ def render_assets_tab(editor: dict, eid: str):
         save_asset(eid, "bgm", up_bgm.getvalue(), up_bgm.name, bgm_label or "")
         st.rerun()
 
-    st.markdown("<br>**🔊 効果音（SE）**", unsafe_allow_html=True)
+    st.markdown("<br>**🔊 効果音（SE）**（合成生成のプリセットSEは「動画を再現する」タブで別途選べます）", unsafe_allow_html=True)
     for se in assets.get("se", []):
         c1, c2 = st.columns([4, 1])
         c1.write(f"🔊 {se['label']}")
@@ -917,7 +1289,7 @@ def render_assets_tab(editor: dict, eid: str):
         st.rerun()
 
 
-# ── タブ5: 設定 ──────────────────────────────────────────────────────────
+# ── タブ6: 設定 ──────────────────────────────────────────────────────────
 def render_editor_settings_tab(editor: dict, eid: str):
     theme_name = get_theme_name()
     t = _get_theme(theme_name)

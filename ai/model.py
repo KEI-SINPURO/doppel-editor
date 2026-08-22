@@ -7,7 +7,8 @@ ai/model.py  ―  Doppel Editor AI エンジン（Claude API版）
   付与されますが、それを使い切ると少額の課金（1回の生成が数円程度）が必要になります。
 
   「AIの強化」は、実際のモデル再学習ではなく、
-  ai/learning.py が組み立てる「ユーザー専用の強化テキスト」を
+  ai/learning.py が組み立てる「ユーザー専用の強化テキスト」と、
+  features/analyze.py が学習した「カットの癖（editing_patterns/rhythm）」を
   システムプロンプトに都度注入する方式（プロンプトベースの継続学習）で実現しています。
 
 必要な環境変数（.env）:
@@ -57,7 +58,7 @@ def is_ai_ready() -> bool:
 
 _BASE_SYSTEM = """あなたは「Doppel AI」――ユーザー自身の動画編集スタイルを学習して育つ、
 「もう一人のユーザー自身（編集クローン）」です。
-与えられたスタイルデータ（テンポ・テロップ・色調）と、過去の高評価データを、
+与えられたスタイルデータ（テンポ・テロップ・色調・カットの癖）と、過去の高評価データを、
 一般論より常に優先してください。
 必ず日本語で、具体的な数値（秒数・px・色コードなど）を含めて回答してください。"""
 
@@ -77,7 +78,34 @@ def build_dynamic_system_prompt(
         s.append(f"- テンポ: {style_data.get('tempo', '不明')}（平均カット間隔 {style_data.get('avg_cut_interval', '不明')}秒）")
         s.append(f"- テロップ色: {style_data.get('dominant_color', '不明')} / 位置: {style_data.get('dominant_position', '不明')}")
         s.append(f"- カット数: {style_data.get('total_cuts', '不明')}")
+        if style_data.get("subtitle_density"):
+            s.append(f"- テロップの出現頻度: 1分あたり約{style_data.get('subtitle_density')}回")
         sections.append("\n".join(s))
+
+        rhythm = style_data.get("rhythm")
+        if rhythm and rhythm.get("rhythm_pattern") and rhythm.get("rhythm_pattern") != "不明":
+            r = ["【カットのリズムパターン（分析結果）】"]
+            r.append(f"- パターン: {rhythm.get('rhythm_pattern')}")
+            r.append(
+                f"- 平均カット間隔: {rhythm.get('avg_interval')}秒"
+                f"（ばらつき ±{rhythm.get('std_interval')}秒、"
+                f"最短{rhythm.get('min_interval')}秒〜最長{rhythm.get('max_interval')}秒）"
+            )
+            sections.append("\n".join(r))
+
+        patterns = style_data.get("editing_patterns")
+        if patterns:
+            p = ["【学習した「カットの癖」（過去のraw素材と完成動画の比較から学習）】"]
+            p.append(f"- 素材のうち残す割合の目安: 約{int(patterns.get('keep_ratio', 1) * 100)}%")
+            p.append(f"- フィラー語（えー、あの、など）の除去傾向: 該当発言のうち約{int(patterns.get('filler_removal_rate', 0) * 100)}%を削る")
+            p.append(f"- カットは文の区切り（句読点）で行われる傾向: 約{int(patterns.get('boundary_tendency', 0) * 100)}%")
+            if patterns.get("avg_cut_duration"):
+                p.append(f"- カットされる発言1つあたりの平均長さ: 約{patterns.get('avg_cut_duration')}秒")
+            if patterns.get("typical_cut_examples"):
+                examples = "／".join(patterns["typical_cut_examples"])
+                p.append(f"- 実際に過去カットされていた発言の例: {examples}")
+            p.append("この傾向を踏まえて、新しい動画でも同じ基準で「残す／削る」を判断してください。")
+            sections.append("\n".join(p))
 
     if reinforcement_text:
         sections.append(reinforcement_text)
@@ -195,14 +223,14 @@ def get_editing_suggestion(
 # ============================================================
 
 _EDIT_PLAN_SYSTEM_EXTRA = """
-これから渡す「文字起こしセグメント」と「学習済みスタイル」をもとに、
+これから渡す「文字起こしセグメント」と「学習済みスタイル（カットの癖を含む）」をもとに、
 新しい動画をこのユーザーらしく自動編集するための「編集プラン」を
 JSONのみで出力してください。前置き・説明文・Markdownのコードフェンスは一切不要です。
 
 出力するJSONの形式:
 {
   "segments": [
-    {"start": 0.0, "end": 2.3, "text": "テロップとして表示する文言", "emphasis": "normal"}
+    {"start": 0.0, "end": 2.3, "text": "テロップとして表示する文言", "emphasis": "normal", "keep": true}
   ],
   "highlight_moments": [
     {"start": 12.0, "end": 12.6, "reason": "驚きの発言"}
@@ -213,7 +241,13 @@ JSONのみで出力してください。前置き・説明文・Markdownのコ�
 ルール:
 - segments は元の発話内容を大きく損なわない範囲で、テンポよく読める長さに要約してよい
 - emphasis は "normal" か "high" のどちらか（highは特に盛り上がる・重要な発言のみ、全体の20%以下に絞る）
-- highlight_moments は「ズームなどの演出を入れると良い瞬間」を最大5件、学習済みスタイルのテンポ感に合わせて選ぶ
+- keep は、このセグメントを最終的な動画に残すかどうか（true/false）。
+  基本は true。学習した「カットの癖」（フィラー語の除去傾向・残す割合・カットされていた
+  発言の実例）を踏まえ、言い淀み・明らかな脱線・不要な繰り返しなど、
+  過去の傾向から見て編集者が削っていたであろう発言だけを false にしてよい。
+  false の割合は、学習した「残す割合」を大きく下回らない範囲に収めること（乱用しない）。
+- highlight_moments は「ズームなどの演出を入れると良い瞬間」を最大5件、学習済みスタイルの
+  テンポ感・リズムパターンに合わせて選ぶ
 - 与えられたセグメントの時間範囲外の時刻は使わない
 """
 
@@ -227,11 +261,12 @@ def generate_edit_plan(
 ) -> Optional[Dict[str, Any]]:
     """
     文字起こしセグメント＋学習済みスタイルから「このユーザーらしい編集プラン」をJSONで生成する。
+    各セグメントには "keep"（残すか削るか）も含まれ、学習した「カットの癖」を反映する。
 
     Returns:
         成功時: {"segments": [...], "highlight_moments": [...], "notes": "..."}
         失敗時（AI未設定・パース失敗など）: None
-        → 呼び出し側は None の場合、文字起こしそのままを使うフォールバック動作にすること。
+        → 呼び出し側は None の場合、ai/heuristic.py のルールベース版にフォールバックすること。
     """
     if not is_ai_ready():
         return None

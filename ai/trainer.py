@@ -349,10 +349,15 @@ def get_editor_summary(editor_id: str) -> str:
     lines = [f"編集者名: {editor['name']}", f"フィードバック数: {editor.get('feedback_count', 0)}"]
     for style in editor.get("styles", {}).values():
         s = style.get("style_data", {})
+        patterns = s.get("editing_patterns", {})
+        pattern_str = (
+            f" / 残す割合={int(patterns.get('keep_ratio', 1) * 100)}%"
+            f" / フィラー除去率={int(patterns.get('filler_removal_rate', 0) * 100)}%"
+        ) if patterns else ""
         lines.append(
             f"- スタイル「{style.get('label', '')}」: "
             f"テンポ={s.get('tempo', '未分析')} / "
             f"テロップ色={s.get('dominant_color', '未分析')} / "
-            f"カット数={s.get('total_cuts', '未分析')}"
+            f"カット数={s.get('total_cuts', '未分析')}{pattern_str}"
         )
     return "\n".join(lines)

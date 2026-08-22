@@ -101,7 +101,10 @@ def render_final_video(
     edit_plan: Dict[str, Any],
     style: dict,
     render_options: Dict[str, Any],
-    progress_cb: Optional[Callable[[int, str], None]] = None,
+    # ※ 戻り値は無視するため Any にしている。呼び出し側が
+    #   st.progress().progress(...) のように何かを返す関数を渡しても型エラーにならないように、
+    #   あえて None 固定にしていない。
+    progress_cb: Optional[Callable[[int, str], Any]] = None,
 ) -> Dict[str, Any]:
     """
     確認・修正済みの編集プランをもとに、実際の動画を書き出す（重い処理）。

@@ -6,6 +6,8 @@
   "exclude": [
     "**/__pycache__",
     "**/venv",
-    "**/.venv"
+    "**/.venv",
+    "**/node_modules",
+    "**/.git"
   ]
 }

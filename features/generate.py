@@ -147,16 +147,20 @@ def _cut_video_core(
         if transition == "crossfade" and len(clips) > 1:
             td = min(transition_duration, min(c.duration for c in clips) / 2)
             prepared = [clips[0]] + [c.crossfadein(td) for c in clips[1:]]
-            final = concatenate_videoclips(prepared, method="compose", padding=-td)
+            # padding は moviepy 1.0.3では float を渡せるが、型スタブ上は int 宣言のため
+            # Pylanceが誤検知する（intに丸めると短いクリップでクロスフェードが効かなくなるため
+            # あえてfloatのまま渡している）
+            final = concatenate_videoclips(prepared, method="compose", padding=-td)  # type: ignore[arg-type]
         elif transition == "fade_black" and len(clips) > 1:
             td = min(transition_duration, min(c.duration for c in clips) / 2)
             prepared = []
             for i, c in enumerate(clips):
                 cc = c
+                # fadein / fadeout も moviepy 1.0.3 に実在するが型スタブ未収録のため誤検知になる
                 if i > 0:
-                    cc = cc.fx(vfx.fadein, td)
+                    cc = cc.fx(vfx.fadein, td)  # type: ignore[attr-defined]
                 if i < len(clips) - 1:
-                    cc = cc.fx(vfx.fadeout, td)
+                    cc = cc.fx(vfx.fadeout, td)  # type: ignore[attr-defined]
                 prepared.append(cc)
             final = concatenate_videoclips(prepared, method="compose")
         else:

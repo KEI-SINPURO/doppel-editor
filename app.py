@@ -34,6 +34,7 @@ import os
 import tempfile
 import zipfile
 import io
+from typing import Dict, Optional, Tuple
 
 st.set_page_config(
     page_title="Doppel Editor",
@@ -140,13 +141,17 @@ def render_options_ui(assets: dict, key_prefix: str):
         実際に書き出す直前に _materialize_render_options() で一時ファイルに変換する。
     """
     bgm_presets = list_bgm_presets()
-    bgm_label_to_path = {"使わない": None}
+    # ★ {"使わない": None} だけで初期化すると、Pyrightはこの辞書の値の型を
+    #   "None" 単体だと推論してしまい、後続の str 代入がエラーになる。
+    #   Optional[str] と明示することで、None/str どちらの代入も正しく型チェックできるようにする。
+    bgm_label_to_path: Dict[str, Optional[str]] = {"使わない": None}
     for p in bgm_presets:
         bgm_label_to_path[f"🎼 プリセット: {p['label']}"] = p["path"]
     for b in assets.get("bgm", []):
         bgm_label_to_path[f"📁 自分の素材: {b['label']}"] = b["path"]
 
-    se_label_to_source = {"なし": None}
+    # 同様に、値の型を Optional[Tuple[str, str]] と明示しておく
+    se_label_to_source: Dict[str, Optional[Tuple[str, str]]] = {"なし": None}
     for name in list_se_preset_names():
         se_label_to_source[f"🎛️ プリセット: {name}"] = ("preset", name)
     for se in assets.get("se", []):
@@ -184,22 +189,29 @@ def render_options_ui(assets: dict, key_prefix: str):
             )
 
     with st.expander("演出オプション（任意）", expanded=False):
+        # ★ st.selectbox() は型上 str | None を返す（Pylanceの型スタブ上、選択肢が空の場合等を
+        #   考慮しているため）。index=0 を渡しているので実際にNoneになることは無いが、
+        #   後続で辞書のキーとして使うため、既存コードの慣習（icon_choice等）に合わせて
+        #   "or 先頭の選択肢" で確実に str 型に倒しておく。
+        transition_keys = list(transition_options.keys())
         transition_choice_label = st.selectbox(
-            "カットのつなぎ方（トランジション）", list(transition_options.keys()),
+            "カットのつなぎ方（トランジション）", transition_keys,
             index=0, key=f"{key_prefix}_transition",
-        )
+        ) or transition_keys[0]
         transition_choice = transition_options[transition_choice_label]
 
+        highlight_fx_keys = list(highlight_fx_options.keys())
         highlight_fx_choice_label = st.selectbox(
-            "ハイライト演出", list(highlight_fx_options.keys()), index=0, key=f"{key_prefix}_highlight_fx",
-        )
+            "ハイライト演出", highlight_fx_keys, index=0, key=f"{key_prefix}_highlight_fx",
+        ) or highlight_fx_keys[0]
         highlight_fx = highlight_fx_options[highlight_fx_choice_label]
         if highlight_fx in ("slowmo", "zoom_slowmo"):
             st.caption("※ スローモーションは音声のピッチも下がります（音程補正は未対応）")
 
+        reframe_keys = list(reframe_options.keys())
         reframe_choice_label = st.selectbox(
-            "画面比率（自動リフレーム）", list(reframe_options.keys()), index=0, key=f"{key_prefix}_reframe",
-        )
+            "画面比率（自動リフレーム）", reframe_keys, index=0, key=f"{key_prefix}_reframe",
+        ) or reframe_keys[0]
         reframe_ratio = reframe_options[reframe_choice_label]
         if reframe_ratio:
             st.caption("※ 顔検出でメインの被写体を追従してクロップします（うまく検出できない場合は中央クロップ）")
@@ -216,13 +228,15 @@ def render_options_ui(assets: dict, key_prefix: str):
         st.caption("🔊 ハイライト効果音 ― 盛り上がりシーンに自動で配置します")
         if len(se_label_to_source) == 1:
             st.caption("（自分のSEを追加するには「自分の素材」タブから登録してください）")
-        se_choice_label = st.selectbox("効果音", list(se_label_to_source.keys()), index=0, key=f"{key_prefix}_se")
+        se_keys = list(se_label_to_source.keys())
+        se_choice_label = st.selectbox("効果音", se_keys, index=0, key=f"{key_prefix}_se") or se_keys[0]
         se_source = se_label_to_source[se_choice_label]
 
         st.caption("🎼 BGM ― プリセット、または自分の素材から選べます")
         if len(bgm_label_to_path) == 1:
             st.caption("プリセットBGMは未登録です（assets/bgm_presets/ 参照）。「自分の素材」タブからも追加できます。")
-        bgm_choice_label = st.selectbox("BGM", list(bgm_label_to_path.keys()), index=0, key=f"{key_prefix}_bgm")
+        bgm_keys = list(bgm_label_to_path.keys())
+        bgm_choice_label = st.selectbox("BGM", bgm_keys, index=0, key=f"{key_prefix}_bgm") or bgm_keys[0]
         bgm_path_choice = bgm_label_to_path[bgm_choice_label]
 
     with st.expander("音質仕上げ・書き出し設定（任意）", expanded=False):
@@ -235,7 +249,7 @@ def render_options_ui(assets: dict, key_prefix: str):
         st.caption("※ どちらも簡易的な処理です。環境音そのものを消すような本格的なノイズ除去はできません。")
         export_preset_label = st.selectbox(
             "書き出し設定", export_preset_names, index=0, key=f"{key_prefix}_export",
-        )
+        ) or export_preset_names[0]
 
     render_options = {
         "transition": transition_choice,
@@ -265,6 +279,21 @@ def render_options_ui(assets: dict, key_prefix: str):
         "export_preset": export_preset_label,
     }
     return render_options, labels
+
+
+def _make_progress_cb(bar):
+    """
+    st.progress() が返すバー(DeltaGenerator)を、pipeline.render_final_video() が
+    期待する Callable[[int, str], None] 形式のコールバックに変換する。
+
+    ループ内でそのまま `lambda p, txt: bar.progress(...)` を作ると、
+    ①bar.progress()の戻り値(DeltaGenerator)が型不一致になる、
+    ②forループ変数の遅延束縛でバーの参照がズレる、という2つの問題があるため、
+    ファクトリ関数として明示的に切り出している。
+    """
+    def _cb(p: int, txt: str) -> None:
+        bar.progress(p, text=txt)
+    return _cb
 
 
 def _materialize_render_options(render_options: dict):
@@ -1043,7 +1072,7 @@ def render_reproduce_tab(editor: dict, eid: str):
         try:
             result = render_final_video(
                 video_bytes, working_plan, style, materialized_options,
-                progress_cb=lambda p, txt: progress.progress(p, text=txt),
+                progress_cb=_make_progress_cb(progress),
             )
         finally:
             for p in temp_paths:
@@ -1156,7 +1185,7 @@ def render_batch_tab(editor: dict, eid: str):
             try:
                 result = render_final_video(
                     video_bytes, plan, style, materialized_options,
-                    progress_cb=lambda p, txt, sp=sub_progress: sp.progress(p, text=txt),
+                    progress_cb=_make_progress_cb(sub_progress),
                 )
             finally:
                 for p in temp_paths:

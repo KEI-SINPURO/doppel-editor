@@ -232,7 +232,9 @@ def apply_speed_ramp(video_bytes: bytes, speed_points: list, factor: float = 0.6
         for s, e in merged:
             if s > cursor:
                 clips.append(video.subclip(cursor, s))
-            clips.append(video.subclip(s, e).fx(vfx.speedx, factor))
+            # speedx は moviepy 1.0.3 に実在するが、型スタブ(moviepy.video.fx.all)に
+            # 未収録のため、Pylanceの reportAttributeAccessIssue が誤検知として出る
+            clips.append(video.subclip(s, e).fx(vfx.speedx, factor))  # type: ignore[attr-defined]
             cursor = e
         if cursor < video.duration:
             clips.append(video.subclip(cursor, video.duration))
@@ -277,7 +279,8 @@ def _get_face_cascade():
         return None
     try:
         cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"  # type: ignore[attr-defined]
-        cascade = cv2.CascadeClassifier(cascade_path)
+        # CascadeClassifier も同様に、opencv-pythonの型スタブに未収録の場合があるための誤検知
+        cascade = cv2.CascadeClassifier(cascade_path)  # type: ignore[attr-defined]
         if cascade.empty():
             raise RuntimeError("cascade empty")
         _FACE_CASCADE = cascade

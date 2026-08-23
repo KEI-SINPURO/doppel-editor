@@ -40,7 +40,7 @@ st.set_page_config(
     page_title="Doppel Editor",
     page_icon="🎬",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="locked",
 )
 
 sys.path.insert(0, os.path.dirname(__file__))

@@ -493,7 +493,7 @@ def render_auth():
         if g.get("success"):
             st.link_button("🔵 Googleでログイン", g["url"], use_container_width=True)
         else:
-            st.caption("Googleログインは現在利用できません（Supabase側の設定が必要です）")
+            st.caption(f"Googleログインは現在利用できません: {g.get('error')}")
 
         st.markdown("<div style='text-align:center;color:#666;font-size:12px;margin:10px 0;'>または</div>",
                      unsafe_allow_html=True)

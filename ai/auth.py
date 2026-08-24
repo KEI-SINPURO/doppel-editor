@@ -111,12 +111,11 @@ def sign_in_with_google() -> dict:
             "provider": "google",
             "options": {"redirect_to": APP_PUBLIC_URL} if APP_PUBLIC_URL else {},
         })
-        res = client.auth.sign_in_with_oauth({
-            "provider": "google",
-            "options": {"redirect_to": APP_PUBLIC_URL} if APP_PUBLIC_URL else {},
-        })
-        url = res.url
-        url += ("&" if "?" in url else "?") + f"apikey={SUPABASE_KEY}"
+        # ★ supabase-pyのバージョンによっては、認証用URLの生成時に
+        #   REST API用のパス(/rest/v1)が誤って混ざることがあるため、ここで正しいパスに直す
+        url = res.url.replace("/rest/v1/auth/v1/authorize", "/auth/v1/authorize")
+        if "apikey=" not in url:
+            url += ("&" if "?" in url else "?") + f"apikey={SUPABASE_KEY}"
         return {"success": True, "url": url}
     except Exception as e:
         return {"success": False, "error": str(e)}

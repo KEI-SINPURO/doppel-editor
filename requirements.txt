@@ -17,7 +17,7 @@
 streamlit>=1.38.0,<2.0.0
 
 # データベース（ユーザー認証・データ保存）／Google OAuthのPKCEフローに対応したバージョン
-supabase>=2.4.0
+supabase==2.24.0
 
 # 環境変数（.envファイルの読み込み）
 python-dotenv>=1.0.0

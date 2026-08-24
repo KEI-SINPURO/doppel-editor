@@ -16,6 +16,7 @@ ai/auth.py  ―  認証層（Supabase）
 
 import os
 import json
+from urllib.parse import urlsplit
 from typing import Optional
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -111,11 +112,10 @@ def sign_in_with_google() -> dict:
             "provider": "google",
             "options": {"redirect_to": APP_PUBLIC_URL} if APP_PUBLIC_URL else {},
         })
-        # ★ supabase-pyのバージョンによっては、認証用URLの生成時に
-        #   REST API用のパス(/rest/v1)が誤って混ざることがあるため、ここで正しいパスに直す
-        url = res.url.replace("/rest/v1/auth/v1/authorize", "/auth/v1/authorize")
+        query = urlsplit(res.url).query
+        url = f"{SUPABASE_URL}/auth/v1/authorize?{query}"
         if "apikey=" not in url:
-            url += ("&" if "?" in url else "?") + f"apikey={SUPABASE_KEY}"
+            url += f"&apikey={SUPABASE_KEY}"
         return {"success": True, "url": url}
     except Exception as e:
         return {"success": False, "error": str(e)}

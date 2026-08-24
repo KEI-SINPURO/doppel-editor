@@ -111,7 +111,13 @@ def sign_in_with_google() -> dict:
             "provider": "google",
             "options": {"redirect_to": APP_PUBLIC_URL} if APP_PUBLIC_URL else {},
         })
-        return {"success": True, "url": res.url}
+        res = client.auth.sign_in_with_oauth({
+            "provider": "google",
+            "options": {"redirect_to": APP_PUBLIC_URL} if APP_PUBLIC_URL else {},
+        })
+        url = res.url
+        url += ("&" if "?" in url else "?") + f"apikey={SUPABASE_KEY}"
+        return {"success": True, "url": url}
     except Exception as e:
         return {"success": False, "error": str(e)}
 

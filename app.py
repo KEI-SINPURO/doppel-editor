@@ -352,6 +352,8 @@ def handle_oauth_callback():
             st.session_state["user"] = result["user"]
             st.session_state["session"] = result["session"]
             st.session_state["page"] = "home_main" if load_editors() else "home_initial"
+        else:
+            st.session_state["_oauth_error"] = result.get("error")  # ← 追加
         st.rerun()
 
 
@@ -494,6 +496,10 @@ def render_auth():
             st.link_button("🔵 Googleでログイン", g["url"], use_container_width=True)
         else:
             st.caption(f"Googleログインは現在利用できません: {g.get('error')}")
+
+        oauth_error = st.session_state.pop("_oauth_error", None)
+        if oauth_error:
+            st.error(f"Googleログインの最終処理でエラーが発生しました: {oauth_error}")
 
         st.markdown("<div style='text-align:center;color:#666;font-size:12px;margin:10px 0;'>または</div>",
                      unsafe_allow_html=True)

@@ -130,7 +130,6 @@ def analyze_style(video_bytes: bytes) -> Optional[dict]:
         print(f"スタイル分析エラー: {e}")
         return None
 
-
 def analyze_cut_rhythm(cut_points: list, duration: float) -> dict:
     """
     カット間隔の「平均」だけでなく「ばらつき（標準偏差）」を見て、

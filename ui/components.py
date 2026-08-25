@@ -174,3 +174,9 @@ def run_ai_with_progress(stream, label: str = "AIが処理中") -> str:
         ss["ai_avg_chars"] = round(avg_chars * 0.7 + len(full_text) * 0.3, 1)
 
     return full_text
+
+def progress_time_text(label: str, pct: int, elapsed: float, avg_seconds: float) -> str:
+    if elapsed < avg_seconds:
+        remaining = avg_seconds - elapsed
+        return f"{label}…　{pct}%　経過 {elapsed:.0f}秒 ／ 残り目安 約{remaining:.0f}秒"
+    return f"{label}…　{pct}%　経過 {elapsed:.0f}秒 ／ 想定（約{avg_seconds:.0f}秒）を超えています。完了までそのままお待ちください"

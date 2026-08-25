@@ -101,17 +101,15 @@ def get_user(access_token: str) -> dict:
 # ============================================================
 
 def sign_in_with_google() -> dict:
-    """
-    Google OAuthの認可URLを発行する。
-    戻り値の url を `st.link_button` 等でユーザーに開いてもらい、
-    Google側の認証後、APP_PUBLIC_URL に ?code=... 付きでリダイレクトされてくる。
-    """
     try:
         client = get_client()
         res = client.auth.sign_in_with_oauth({
             "provider": "google",
             "options": {"redirect_to": APP_PUBLIC_URL} if APP_PUBLIC_URL else {},
         })
+        import streamlit as st
+        st.write(vars(res))
+
         query = urlsplit(res.url).query
         url = f"{SUPABASE_URL}/auth/v1/authorize?{query}"
         if "apikey=" not in url:

@@ -16,8 +16,13 @@ ai/auth.py  ―  認証層（Supabase）
 
 import os
 import json
-from urllib.parse import urlsplit
+import base64
+import hashlib
+import secrets
+import tempfile
+from urllib.parse import urlencode
 from typing import Optional
+import httpx
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -100,20 +105,39 @@ def get_user(access_token: str) -> dict:
 # Googleログイン（OAuth）
 # ============================================================
 
-def sign_in_with_google() -> dict:
-    try:
-        client = get_client()
-        res = client.auth.sign_in_with_oauth({
-            "provider": "google",
-            "options": {"redirect_to": APP_PUBLIC_URL} if APP_PUBLIC_URL else {},
-        })
-        import streamlit as st
-        st.write(vars(res))
+def _pkce_verifier_path() -> str:
+    """code_verifierを一時保存するファイルパス（同一プロセス内でタブをまたいで共有するため）"""
+    return os.path.join(tempfile.gettempdir(), "doppel_oauth_verifier.txt")
 
-        query = urlsplit(res.url).query
-        url = f"{SUPABASE_URL}/auth/v1/authorize?{query}"
-        if "apikey=" not in url:
-            url += f"&apikey={SUPABASE_KEY}"
+
+def _generate_pkce_pair():
+    """PKCE用のcode_verifier / code_challengeを自前で生成する"""
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def sign_in_with_google() -> dict:
+    """
+    Google OAuthの認可URLを発行する。
+    ライブラリ側のPKCE状態管理（タブをまたぐと消えてしまう）を使わず、
+    code_verifierを自分たちで生成・一時保存し、認可URLも直接組み立てる。
+    """
+    try:
+        verifier, challenge = _generate_pkce_pair()
+        with open(_pkce_verifier_path(), "w") as f:
+            f.write(verifier)
+
+        params = {
+            "provider": "google",
+            "redirect_to": APP_PUBLIC_URL,
+            "code_challenge": challenge,
+            "code_challenge_method": "s256",
+            "apikey": SUPABASE_KEY,
+        }
+        url = f"{SUPABASE_URL}/auth/v1/authorize?{urlencode(params)}"
         return {"success": True, "url": url}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -122,13 +146,35 @@ def sign_in_with_google() -> dict:
 def exchange_code_for_session(code: str) -> dict:
     """GoogleログインのリダイレクトURLから受け取った code をセッションに交換する"""
     try:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            return {"success": False, "error": "SUPABASE_URL/SUPABASE_KEYが設定されていません"}
+        verifier_path = _pkce_verifier_path()
+        if not os.path.exists(verifier_path):
+            return {"success": False, "error": "code_verifierが見つかりません。もう一度ログインをやり直してください。"}
+        with open(verifier_path, "r") as f:
+            verifier = f.read().strip()
+        os.remove(verifier_path)
+
+        resp = httpx.post(
+            f"{SUPABASE_URL}/auth/v1/token",
+            params={"grant_type": "pkce"},
+            headers={"apikey": SUPABASE_KEY, "Content-Type": "application/json"},
+            json={"auth_code": code, "code_verifier": verifier},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return {"success": False, "error": f"{resp.status_code}: {resp.text[:300]}"}
+
+        data = resp.json()
+        access_token = data.get("access_token")
+        refresh_token = data.get("refresh_token")
+        if not access_token or not refresh_token:
+            return {"success": False, "error": "トークンの取得に失敗しました"}
+
         client = get_client()
-        # ★ Supabase公式Pythonリファレンスの例と同じ呼び方（{"auth_code": code}のみ）で問題ない。
-        #   ライブラリ内部の型定義(CodeExchangeParams)が実際の必須項目より厳しく書かれているだけの
-        #   誤検知のため、ここでは無視する。
-        res = client.auth.exchange_code_for_session({"auth_code": code})  # type: ignore[arg-type]
-        if res.session and res.user:
-            return {"success": True, "user": res.user, "session": res.session}
+        session_res = client.auth.set_session(access_token, refresh_token)
+        if session_res.session and session_res.user:
+            return {"success": True, "user": session_res.user, "session": session_res.session}
         return {"success": False, "error": "セッション交換に失敗しました"}
     except Exception as e:
         return {"success": False, "error": str(e)}

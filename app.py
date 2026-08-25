@@ -493,7 +493,6 @@ def render_auth():
 
         g = sign_in_with_google()
         if g.get("success"):
-            st.code(g["url"])
             st.link_button("🔵 Googleでログイン", g["url"], use_container_width=True)
         else:
             st.caption(f"Googleログインは現在利用できません: {g.get('error')}")

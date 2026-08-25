@@ -183,7 +183,21 @@ def get_css(theme_name: str) -> str:
         .stButton > button p, div[data-testid="stButton"] > button p {{
             color: inherit !important; font-size: 13px !important;
         }}
-
+        div[data-testid="stLinkButton"] a {{
+            background-color: {t['button_bg']} !important; color: {t['text_primary']} !important;
+            border: 0.5px solid {t['border']} !important; border-radius: 8px !important;
+            padding: 10px 18px !important; font-size: 13px !important; font-weight: 400 !important;
+            display: flex !important; align-items: center !important; justify-content: center !important;
+            width: 100% !important; text-decoration: none !important;
+            transition: background-color 0.2s, border-color 0.2s, color 0.2s !important;
+        }}
+        div[data-testid="stLinkButton"] a:hover {{
+            background-color: {t['button_hover']} !important; border-color: {t['accent']}88 !important;
+            color: {t['accent']} !important;
+        }}
+        div[data-testid="stLinkButton"] a p {{
+            color: inherit !important; font-size: 13px !important; margin: 0 !important;
+        }}
         div[data-testid="stButton"] button[kind="primary"],
         button[data-testid="baseButton-primary"], .stButton button[kind="primary"] {{
             background: linear-gradient(135deg, {t['accent_sub']}, {t['accent']}) !important;

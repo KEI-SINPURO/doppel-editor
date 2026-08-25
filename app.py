@@ -893,23 +893,36 @@ def render_learn_tab(editor: dict, eid: str):
         up_edit = st.file_uploader("完成動画", type=["mp4", "mov", "avi", "mkv", "webm"], key="learn_edit")
 
     if up_edit and st.button("この動画からスタイルを学習する", type="primary", use_container_width=True, key="learn_btn"):
-        with st.spinner("動画を解析中..."):
-            style_data = analyze_style(up_edit.getvalue())
-            brightness = analyze_brightness(up_edit.getvalue())
+        ss = st.session_state
+        avg_seconds = ss.get("learn_avg_seconds", 30.0)
+        start = time.time()
+        bar = st.progress(0.0, text="動画を解析中…　準備中")
 
-            editing_patterns = None
-            if up_raw and style_data:
-                st.caption("編集前素材と比較して「カットの癖」も学習しています…（少し時間がかかります）")
-                # 同じ動画をもう一度アップロードしなくて済むよう、raw/edited 双方をここで
-                # 一度だけ文字起こしし、「どこが残されて、どこが削られたか」を比較する。
-                raw_result = transcribe_video(up_raw.getvalue(), language="ja", model_size="tiny")
-                edited_result = transcribe_video(up_edit.getvalue(), language="ja", model_size="tiny")
-                if raw_result and edited_result:
-                    editing_patterns = analyze_editing_patterns(
-                        raw_result["segments"], edited_result["segments"],
-                    )
-                    if editing_patterns:
-                        style_data["editing_patterns"] = editing_patterns
+        def _update(pct: int, label: str):
+            elapsed = time.time() - start
+            remaining = max(avg_seconds - elapsed, 1)
+            bar.progress(pct / 100, text=f"{label}…　{pct}%　経過 {elapsed:.0f}秒 ／ 残り目安 約{remaining:.0f}秒")
+
+        _update(10, "テロップ・カットを解析中")
+        style_data = analyze_style(up_edit.getvalue())
+        _update(40, "明るさ・色調を解析中")
+        brightness = analyze_brightness(up_edit.getvalue())
+
+        editing_patterns = None
+        if up_raw and style_data:
+            _update(55, "編集前素材と比較中（カットの癖を学習）")
+            raw_result = transcribe_video(up_raw.getvalue(), language="ja", model_size="tiny")
+            _update(80, "完成動画を文字起こし中")
+            edited_result = transcribe_video(up_edit.getvalue(), language="ja", model_size="tiny")
+            if raw_result and edited_result:
+                editing_patterns = analyze_editing_patterns(
+                    raw_result["segments"], edited_result["segments"],
+                )
+                if editing_patterns:
+                    style_data["editing_patterns"] = editing_patterns
+
+        _update(100, "完了")
+        ss["learn_avg_seconds"] = round(avg_seconds * 0.7 + (time.time() - start) * 0.3, 1)
 
         if style_data:
             save_style_data(eid, target_sid, style_data, brightness)

@@ -164,7 +164,7 @@ def run_ai_with_progress(stream, label: str = "AIが処理中") -> str:
         time_pct = elapsed / max(avg_seconds, 1)
         pct = min(max(char_pct, time_pct), 0.95)
         remaining = max(avg_seconds - elapsed, 1)
-        bar.progress(pct, text=f"{label}…　経過 {elapsed:.0f}秒 ／ 残り目安 約{remaining:.0f}秒")
+        bar.progress(pct, text=f"{label}…　{int(pct * 100)}%　経過 {elapsed:.0f}秒 ／ 残り目安 約{remaining:.0f}秒")
 
     elapsed_total = time.time() - start
     bar.progress(1.0, text=f"✅ 完了！（{elapsed_total:.0f}秒）")

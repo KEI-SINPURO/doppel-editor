@@ -31,6 +31,7 @@ app.py  ―  Doppel Editor メインアプリケーション（v2: スコープ�
 import streamlit as st
 import sys
 import os
+import time
 import tempfile
 import zipfile
 import io
@@ -285,14 +286,20 @@ def _make_progress_cb(bar):
     """
     st.progress() が返すバー(DeltaGenerator)を、pipeline.render_final_video() が
     期待する Callable[[int, str], None] 形式のコールバックに変換する。
-
-    ループ内でそのまま `lambda p, txt: bar.progress(...)` を作ると、
-    ①bar.progress()の戻り値(DeltaGenerator)が型不一致になる、
-    ②forループ変数の遅延束縛でバーの参照がズレる、という2つの問題があるため、
-    ファクトリ関数として明示的に切り出している。
+    過去のレンダリング時間の平均から「残り時間の目安」を算出し、
+    進捗率(%)とあわせてバーの文言に表示する。
     """
+    ss = st.session_state
+    avg_seconds = ss.get("render_avg_seconds", 240.0)  # 初回は4分を仮の目安にする
+    start = time.time()
+
     def _cb(p: int, txt: str) -> None:
-        bar.progress(p, text=txt)
+        elapsed = time.time() - start
+        remaining = max(avg_seconds - elapsed, 1)
+        bar.progress(p, text=f"{txt}　{p}%　経過 {elapsed:.0f}秒 ／ 残り目安 約{remaining:.0f}秒")
+        if p >= 100:
+            ss["render_avg_seconds"] = round(avg_seconds * 0.7 + elapsed * 0.3, 1)
+
     return _cb
 
 

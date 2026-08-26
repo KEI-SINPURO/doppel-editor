@@ -163,6 +163,34 @@ def chat_stream(prompt: str, system_prompt: str, model: str = DEFAULT_MODEL,
     except Exception as e:
         yield f"AI処理中にエラーが発生しました: {e}"
 
+def chat_structured(
+    prompt: str, system_prompt: str, schema: dict, model: str = DEFAULT_MODEL,
+    max_tokens: int = 4000, temperature: float = 0.4,
+) -> "Optional[Dict[str, Any]]":
+    """
+    Claude APIの Structured Outputs（output_config）を使い、
+    指定したJSON Schemaに必ず一致するレスポンスを受け取る。
+    従来の「AIの自由記述をregexで抜き出す」方式と違い、パース失敗が構造上起きない。
+    """
+    client = _get_client()
+    if not client:
+        return None
+    try:
+        resp = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system_prompt,
+            messages=[{"role": "user", "content": prompt}],
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+        )
+        text = next((block.text for block in resp.content if block.type == "text"), None)
+        if not text:
+            return None
+        return json.loads(text)
+    except Exception as e:
+        print(f"構造化出力エラー: {e}")
+        return None
 
 # ============================================================
 # サムネイル提案
@@ -251,6 +279,43 @@ JSONのみで出力してください。前置き・説明文・Markdownのコ�
 - 与えられたセグメントの時間範囲外の時刻は使わない
 """
 
+_EDIT_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "number"},
+                    "end": {"type": "number"},
+                    "text": {"type": "string"},
+                    "emphasis": {"type": "string", "enum": ["normal", "high"]},
+                    "keep": {"type": "boolean"},
+                },
+                "required": ["start", "end", "text", "emphasis", "keep"],
+                "additionalProperties": False,
+            },
+        },
+        "highlight_moments": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "number"},
+                    "end": {"type": "number"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["start", "end", "reason"],
+                "additionalProperties": False,
+            },
+        },
+        "notes": {"type": "string"},
+    },
+    "required": ["segments", "highlight_moments", "notes"],
+    "additionalProperties": False,
+}
 
 def generate_edit_plan(
     transcript_segments: List[Dict[str, Any]],
@@ -261,16 +326,17 @@ def generate_edit_plan(
 ) -> Optional[Dict[str, Any]]:
     """
     文字起こしセグメント＋学習済みスタイルから「このユーザーらしい編集プラン」をJSONで生成する。
-    各セグメントには "keep"（残すか削るか）も含まれ、学習した「カットの癖」を反映する。
-
+    Structured Outputsにより、返ってくるJSONの形式は必ず _EDIT_PLAN_SCHEMA と一致する
+    （パース失敗によるルールベースへの意図しないフォールバックが起きなくなる）。
+ 
     Returns:
         成功時: {"segments": [...], "highlight_moments": [...], "notes": "..."}
-        失敗時（AI未設定・パース失敗など）: None
+        失敗時（AI未設定・APIエラーなど）: None
         → 呼び出し側は None の場合、ai/heuristic.py のルールベース版にフォールバックすること。
     """
     if not is_ai_ready():
         return None
-
+ 
     compact = [
         {"start": round(s.get("start", 0), 2), "end": round(s.get("end", 0), 2),
          "text": s.get("text", "").strip()}
@@ -278,14 +344,13 @@ def generate_edit_plan(
     ]
     if not compact:
         return None
-
+ 
     prompt = f"文字起こしセグメント(JSON):\n{json.dumps(compact, ensure_ascii=False)}"
     system = build_dynamic_system_prompt(
         style_data, style_label, reinforcement_text, extra=_EDIT_PLAN_SYSTEM_EXTRA
     )
-
-    raw = chat(prompt, system, model=model, max_tokens=4000, temperature=0.4)
-    return _parse_json_safely(raw)
+ 
+    return chat_structured(prompt, system, _EDIT_PLAN_SCHEMA, model=model, max_tokens=4000, temperature=0.4)
 
 
 def _parse_json_safely(text: str) -> Optional[Dict[str, Any]]:

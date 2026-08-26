@@ -279,6 +279,24 @@ def get_css(theme_name: str) -> str:
         [data-testid="stFileUploaderDropzoneInstructions"] span,
         [data-testid="stFileUploaderDropzoneInstructions"] small {{ color: {t['text_secondary']} !important; }}
 
+        [data-testid="stFileUploaderFile"] {{
+            background-color: {t['bg_secondary']} !important;
+            border: 0.5px solid {t['border']} !important; border-radius: 8px !important;
+        }}
+        [data-testid="stFileUploaderFileName"] {{
+            color: {t['text_primary']} !important; font-size: 13px !important;
+        }}
+        [data-testid="stFileUploaderFile"] small,
+        [data-testid="stFileUploaderFile"] span {{
+            color: {t['text_secondary']} !important;
+        }}
+        [data-testid="stFileUploaderDeleteBtn"] button {{
+            color: {t['text_secondary']} !important; background: transparent !important;
+        }}
+        [data-testid="stFileUploaderDeleteBtn"] button:hover {{
+            color: {t['error']} !important;
+        }}
+
         .stRadio label p {{ color: {t['text_primary']} !important; font-size: 14px !important; }}
         .stMultiSelect > div > div {{
             background-color: {t['bg_card']} !important; border: 0.5px solid {t['border']} !important; border-radius: 8px !important;

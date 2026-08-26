@@ -894,25 +894,50 @@ def render_learn_tab(editor: dict, eid: str):
 
     if up_edit and st.button("この動画からスタイルを学習する", type="primary", use_container_width=True, key="learn_btn"):
         ss = st.session_state
-        avg_seconds = ss.get("learn_avg_seconds", 30.0)
+        RATE_KEY = "whisper_tiny_sec_per_mb"
+        # 「1MBあたり何秒かかるか」を実測して学習していく（初回は保守的な仮の値）
+        rate = ss.get(RATE_KEY, 12.0)
+
+        def _mb(data: bytes) -> float:
+            return len(data) / (1024 * 1024)
+
+        style_budget = 20.0
+        total_budget = style_budget
+        if up_raw:
+            total_budget += rate * _mb(up_raw.getvalue()) + rate * _mb(up_edit.getvalue())
+
         start = time.time()
         bar = st.progress(0.0, text="動画を解析中…　準備中")
 
-        def _update(pct: int, label: str):
+        def _update(pct: int, label: str, budget_known: bool = True):
             elapsed = time.time() - start
-            remaining = max(avg_seconds - elapsed, 1)
-            bar.progress(pct / 100, text=f"{label}…　{pct}%　経過 {elapsed:.0f}秒 ／ 残り目安 約{remaining:.0f}秒")
+            if budget_known:
+                remaining = max(total_budget - elapsed, 3)
+                suffix = f"経過 {elapsed:.0f}秒 ／ 残り目安 約{remaining:.0f}秒"
+            else:
+                suffix = f"経過 {elapsed:.0f}秒 ／ 残り時間を計測中…"
+            bar.progress(pct / 100, text=f"{label}…　{pct}%　{suffix}")
 
-        _update(10, "テロップ・カットを解析中")
+        _update(5, "テロップ・カットを解析中")
         style_data = analyze_style(up_edit.getvalue())
-        _update(40, "明るさ・色調を解析中")
+        _update(15, "明るさ・色調を解析中")
         brightness = analyze_brightness(up_edit.getvalue())
 
         editing_patterns = None
         if up_raw and style_data:
-            _update(55, "編集前素材と比較中（カットの癖を学習）")
-            raw_result = transcribe_video(up_raw.getvalue(), language="ja", model_size="tiny")
-            _update(80, "完成動画を文字起こし中")
+            raw_bytes = up_raw.getvalue()
+            _update(20, "編集前素材を文字起こし中（動画が長いと数分かかることがあります）", budget_known=False)
+            t0 = time.time()
+            raw_result = transcribe_video(raw_bytes, language="ja", model_size="tiny")
+            raw_elapsed = time.time() - t0
+            raw_mb = _mb(raw_bytes)
+            if raw_mb > 0.5:
+                measured_rate = raw_elapsed / raw_mb
+                rate = round(rate * 0.3 + measured_rate * 0.7, 2)
+                ss[RATE_KEY] = rate
+                total_budget = style_budget + raw_elapsed + rate * _mb(up_edit.getvalue())
+
+            _update(60, "完成動画を文字起こし中")
             edited_result = transcribe_video(up_edit.getvalue(), language="ja", model_size="tiny")
             if raw_result and edited_result:
                 editing_patterns = analyze_editing_patterns(
@@ -922,24 +947,6 @@ def render_learn_tab(editor: dict, eid: str):
                     style_data["editing_patterns"] = editing_patterns
 
         _update(100, "完了")
-        ss["learn_avg_seconds"] = round(avg_seconds * 0.7 + (time.time() - start) * 0.3, 1)
-
-        if style_data:
-            save_style_data(eid, target_sid, style_data, brightness)
-            add_video_to_style(eid, target_sid, {
-                "title": up_edit.name, "with_raw": up_raw.name if up_raw else None,
-            })
-            _sync_editor(eid)
-            msg = "学習が完了しました！「動画を再現する」タブで使えます。"
-            if editing_patterns:
-                msg += (
-                    f"（素材の約{int(editing_patterns.get('keep_ratio', 1) * 100)}%を残す傾向、"
-                    f"フィラー語除去率 約{int(editing_patterns.get('filler_removal_rate', 0) * 100)}% を学習しました）"
-                )
-            st.success(msg)
-            st.rerun()
-        else:
-            st.error("動画の解析に失敗しました。ファイル形式をご確認ください。")
 
 
 # ── タブ2: 動画を再現する（★ 今回の核となる機能） ──────────────────────

@@ -46,6 +46,18 @@ ai/model.py  ―  Doppel Editor AI エンジン（Claude API版）
     「改善が必要」だった例も「避けるべき傾向」として強化データに含めるようにした。
     また、現在使っているスタイル名に一致するフィードバックを優先して使うようにした。
 
+【さらなるアップデート（実際の映像編集で「足りていなかった」部分の補完）】
+  - highlight_moments に任意の se_mood（"ding"/"impact"/"whoosh"/"pop"/"buzz"/"tada"）を
+    付けられるようにした。features/se_presets.py の get_se_bytes_by_mood と組み合わせ、
+    「盛り上がりの種類に応じて効果音を自動で使い分ける」機能（render_options_ui の
+    「🤖 AIにおまかせ」選択肢）に使われる。以前は動画全体で1種類の効果音しか使えなかった。
+  - features/branding.py の mix_bgm() に、発話区間だけBGM音量を追加で下げる
+    「自動ダッキング」を追加した（pipeline.py から常時適用）。以前はBGMが動画全体で
+    一定音量のままで、セリフに被って聞き取りづらくなることがあった。
+  - generate_video_description() を追加。完成動画で実際に使われた発言から、
+    YouTube投稿用の概要欄文章とタイムスタンプ付きチャプターを自動生成できるようにした
+    （「動画を再現する」タブの「概要欄・チャプターも作る」から利用）。
+
 必要な環境変数（.env）:
   ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxx
   （取得方法: https://console.anthropic.com）
@@ -294,7 +306,12 @@ def chat_with_images(prompt: str, system_prompt: str, images: Optional[List[Dict
             max_tokens=max_tokens,
             temperature=temperature,
             system=system_prompt,
-            messages=[{"role": "user", "content": content}],
+            # ★ content は実行時には {"type": "image"/"text", ...} 形式の辞書リストのままで
+            #   問題なく動作する（Anthropic APIは素のJSON構造を受け付ける）。だが型スタブ上は
+            #   TextBlockParam | ImageBlockParam 等の厳密なTypedDictユニオンを要求しており、
+            #   Dict[str, Any]で組み立てているためPylanceが誤検知する。
+            #   ai/auth.py の exchange_code_for_session と同じ理由の誤検知のため無視する。
+            messages=[{"role": "user", "content": content}],  # type: ignore[arg-type]
         )
         return "".join(block.text for block in resp.content if block.type == "text")
     except Exception as e:
@@ -410,7 +427,7 @@ JSONのみで出力してください。前置き・説明文・Markdownのコ�
     {"start": 0.0, "end": 2.3, "text": "テロップとして表示する文言", "emphasis": "normal", "keep": true}
   ],
   "highlight_moments": [
-    {"start": 12.0, "end": 12.6, "reason": "驚きの発言"}
+    {"start": 12.0, "end": 12.6, "reason": "驚きの発言", "se_mood": "impact"}
   ],
   "notes": "この動画全体の編集方針を一言で"
 }
@@ -429,6 +446,15 @@ JSONのみで出力してください。前置き・説明文・Markdownのコ�
 - highlight_moments は「ズームなどの演出を入れると良い瞬間」を最大5件、学習済みスタイルの
   テンポ感・リズムパターンに合わせて選ぶ。音量・キーワードから機械的に検出した候補が
   別途渡された場合は、参考にしつつ、文脈的に妥当なものだけを採用してよい（丸写し不要）。
+- highlight_moments の各要素には、任意で se_mood を付けてよい（「効果音をAIにおまかせ」機能で
+  使われる）。その瞬間のトーンに最も近いものを1つだけ選ぶこと:
+    "ding"   … 嬉しい発見・ポジティブな驚き
+    "impact" … 強い衝撃・シリアスな驚き
+    "whoosh" … 場面転換・テンポの良い切り替え
+    "pop"    … 軽いリアクション・ちょっとしたツッコミ
+    "buzz"   … 残念・失敗・警告
+    "tada"   … 達成・成功・締めくくり
+  迷う場合、効果音が不要と判断する場合は省略してよい（省略時は付けない方がよい）。
 - 与えられたセグメントの時間範囲外の時刻は使わない
 - segments の順序は、渡された文字起こしセグメントの時系列順のまま出力すること
   （このシステムは発言の並び替え再現には対応していないため、順序を入れ替えないこと）
@@ -442,6 +468,9 @@ _EDIT_PLAN_MAX_TOKENS = 8000
 # 1回のAPI呼び出しに渡すセグメント数の上限。これを超える動画は自動的に分割処理する。
 _CHUNK_SIZE = 70
 _CHUNK_TRIGGER = 90
+
+# ハイライト瞬間に付与できる se_mood の許可リスト（features/se_presets.py と対応）
+_ALLOWED_SE_MOODS = {"ding", "impact", "whoosh", "pop", "buzz", "tada"}
 
 
 def _format_highlight_hints(hints: Optional[List[Dict[str, Any]]]) -> str:
@@ -714,11 +743,15 @@ def _validate_and_repair_plan(plan: Dict[str, Any], reference_segments: List[Dic
         end = _clip(h.get("end", start + 0.5), start + 0.5)
         if end <= start:
             continue
-        fixed_highlights.append({
+        entry = {
             "start": start,
             "end": end,
             "reason": str(h.get("reason", "") or ""),
-        })
+        }
+        se_mood = h.get("se_mood")
+        if se_mood in _ALLOWED_SE_MOODS:
+            entry["se_mood"] = se_mood
+        fixed_highlights.append(entry)
 
     plan["segments"] = fixed_segments
     plan["highlight_moments"] = fixed_highlights
@@ -741,3 +774,88 @@ def _parse_json_safely(text: Optional[str]) -> Optional[Dict[str, Any]]:
         return json.loads(match.group(0))
     except Exception:
         return None
+
+
+# ============================================================
+# ★ 概要欄・チャプターの自動生成（NEW ― 「動画編集で足りていない部分」の補完）
+# ============================================================
+# プロの編集者・投稿者の仕事には、カット編集そのものだけでなく
+# 「YouTube投稿用の概要欄・チャプター作成」も含まれることが多い。
+# 完成動画で実際に使われた発言（カット後のタイムライン基準）から、
+# それらしい概要文とタイムスタンプ付きチャプターを自動生成する。
+
+_DESCRIPTION_SYSTEM_EXTRA = """
+渡す「実際に完成動画で使われた発言」（カット後のタイムライン上の開始時刻付き）をもとに、
+YouTube投稿用の概要欄とチャプターを日本語でJSONのみで出力してください。
+前置き・説明文・Markdownのコードフェンスは一切不要です。
+
+出力するJSONの形式:
+{
+  "description": "視聴者向けの動画概要文（2〜4文程度。任意でハッシュタグを2〜4個末尾に添えてよい）",
+  "chapters": [
+    {"time": "0:00", "title": "オープニング"},
+    {"time": "1:23", "title": "○○について"}
+  ]
+}
+
+ルール:
+- chapters は必ず "0:00" から始めること（YouTubeがチャプターとして認識するための必須要件）
+- チャプターは3〜8個程度、動画の展開・話題の転換に応じて自然な区切りで設定する
+- time は "分:秒"（1時間を超える場合のみ "時:分:秒"）形式の文字列にする
+- 学習したテロップの文体（渡されていれば）があれば、descriptionの文体もそれに寄せてよい
+- 発言内容から明らかに読み取れないことは書かない（誇張・憶測を避ける）
+"""
+
+
+def generate_video_description(
+    kept_segments: List[Dict[str, Any]],
+    style_data: Optional[dict] = None,
+    style_label: str = "",
+    reinforcement_text: str = "",
+    model: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    完成動画（カット後のタイムライン基準）で実際に使われた発言から、
+    YouTube投稿用の概要欄文章とチャプター（タイムスタンプ付き見出し）を生成する。
+
+    Args:
+        kept_segments: 実際に使われた発言 [{"start","end","text",...}, ...]。
+                       pipeline.render_final_video() の戻り値の "sub_segments" を
+                       そのまま渡す想定（カット・時刻補正後のタイムライン基準のため）。
+        style_data / style_label / reinforcement_text: 従来通り
+
+    Returns:
+        {"description": str, "chapters": [{"time": str, "title": str}, ...]}
+        AI未使用・発言が無い・生成に失敗した場合は None。
+    """
+    if not is_ai_ready() or not kept_segments:
+        return None
+
+    compact = [
+        {"start": round(s.get("start", 0), 1), "text": (s.get("text") or "").strip()}
+        for s in kept_segments if (s.get("text") or "").strip()
+    ]
+    if not compact:
+        return None
+
+    resolved_model = model or DEFAULT_MODEL
+    system = build_dynamic_system_prompt(
+        style_data, style_label, reinforcement_text, extra=_DESCRIPTION_SYSTEM_EXTRA
+    )
+    prompt = f"実際に使われた発言(JSON。startはカット後タイムライン基準の秒数):\n{json.dumps(compact, ensure_ascii=False)}"
+
+    raw = chat(prompt, system, model=resolved_model, max_tokens=1200, temperature=0.5)
+    result = _parse_json_safely(raw)
+    if not result or not isinstance(result.get("chapters"), list):
+        return None
+
+    chapters = [c for c in result.get("chapters", []) if isinstance(c, dict) and c.get("title")]
+    if not chapters:
+        return None
+    if chapters[0].get("time") != "0:00":
+        chapters = [{"time": "0:00", "title": "オープニング"}] + chapters
+
+    return {
+        "description": str(result.get("description", "") or ""),
+        "chapters": chapters[:12],
+    }

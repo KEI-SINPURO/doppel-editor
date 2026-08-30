@@ -79,6 +79,7 @@ from ai.auth import (
 from ai.model import (
     is_ai_ready, get_thumbnail_suggestion, get_quality_mode,
     is_visual_mode_enabled, describe_visual_editing_style,
+    generate_video_description,
 )
 from ai.learning import FeedbackLearner
 
@@ -103,6 +104,7 @@ DEFAULTS = {
     "session": None,
     "delete_confirm_id": None,
     "last_thumbnail": "",
+    "last_description": None,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -158,6 +160,10 @@ def render_options_ui(assets: dict, key_prefix: str):
 
     # 同様に、値の型を Optional[Tuple[str, str]] と明示しておく
     se_label_to_source: Dict[str, Optional[Tuple[str, str]]] = {"なし": None}
+    # 【NEW】場面のトーン（驚き・達成・失敗 等）に応じて、AIが効果音の種類を自動で
+    # 使い分ける「AIにおまかせ」。ai/model.py の se_mood と features/se_presets.py の
+    # get_se_bytes_by_mood で実現している（組み込みプリセットの範囲内での使い分け）。
+    se_label_to_source["🤖 AIにおまかせ（場面ごとに種類を使い分け）"] = ("ai_auto", "")
     for name in list_se_preset_names():
         se_label_to_source[f"🎛️ プリセット: {name}"] = ("preset", name)
     for se in assets.get("se", []):
@@ -317,6 +323,7 @@ def _materialize_render_options(render_options: dict):
 
     se_source = render_options.get("se_source")
     se_path = None
+    se_ai_auto = False
     if se_source:
         kind, value = se_source
         if kind == "preset":
@@ -326,9 +333,14 @@ def _materialize_render_options(render_options: dict):
                     sf.write(se_bytes)
                     se_path = sf.name
                 temp_paths.append(se_path)
+        elif kind == "ai_auto":
+            # 単一のse_pathは使わず、pipeline.py側でハイライトごとにse_moodを見て
+            # 効果音を自動生成・使い分ける（features/se_presets.py の get_se_bytes_by_mood）
+            se_ai_auto = True
         else:
             se_path = value
     materialized["se_path"] = se_path
+    materialized["se_ai_auto"] = se_ai_auto
     materialized.pop("se_source", None)
 
     narration_file = render_options.get("narration_file")
@@ -1177,6 +1189,34 @@ def render_reproduce_tab(editor: dict, eid: str):
                             file_name=f"{base_name}_doppel.mp4", mime="video/mp4", use_container_width=True)
         st.download_button("📄 字幕ファイル (.srt) もダウンロード", data=result["srt"].encode("utf-8"),
                             file_name=f"{base_name}.srt", mime="text/plain", use_container_width=True)
+
+        # 【NEW】完成動画で実際に使われた発言から、YouTube投稿用の概要欄とチャプターを生成する
+        with st.expander("📋 概要欄・チャプターも作る（任意）", expanded=False):
+            st.caption("実際に使われた発言をもとに、YouTube投稿用の概要欄とタイムスタンプ付きチャプターをAIが作成します。")
+            if st.button("概要欄・チャプターを生成する", key="gen_desc_btn", use_container_width=True):
+                if not is_ai_ready():
+                    st.warning("Claude APIが利用できないため生成できません（.env の ANTHROPIC_API_KEY をご確認ください）")
+                else:
+                    with st.spinner("生成中..."):
+                        learner_desc = FeedbackLearner(eid)
+                        desc = generate_video_description(
+                            result["sub_segments"], style_data, style.get("label", ""),
+                            learner_desc.build_reinforcement_prompt(style.get("label", "")),
+                        )
+                    st.session_state["last_description"] = desc
+                    if not desc:
+                        st.warning("生成に失敗しました（発言が短すぎる可能性があります）。")
+
+            last_desc = st.session_state.get("last_description")
+            if last_desc:
+                st.text_area("概要欄", value=last_desc.get("description", ""), height=90, key="desc_output")
+                chapter_lines = "\n".join(
+                    f"{c.get('time', '0:00')} {c.get('title', '')}" for c in last_desc.get("chapters", [])
+                )
+                st.text_area(
+                    "チャプター（そのままYouTubeの概要欄に貼り付け可）",
+                    value=chapter_lines, height=140, key="chapters_output",
+                )
 
         add_video_to_style(eid, selected_sid, {"title": combined_label_final, "type": "reproduced"})
 

@@ -11,10 +11,14 @@ features/se_presets.py  ―  「定番」効果音（SE）のプリセット
   個性的な・こだわりのある効果音は、引き続き「自分の素材」タブから
   自分でアップロードして使う（本物の効果音ファイルを使いたい場合はそちら）。
 
-使い方:
+使い方（人が選ぶ場合・UI用）:
     from features.se_presets import list_se_preset_names, get_se_preset_bytes
     names = list_se_preset_names()              # ["ピコン（通知音）", ...]
     wav_bytes = get_se_preset_bytes(names[0])    # WAVファイルのバイト列
+
+使い方（AIが選ぶ場合・「AIにおまかせ」機能用・NEW）:
+    from features.se_presets import get_se_bytes_by_mood
+    wav_bytes = get_se_bytes_by_mood("impact")   # ai/model.py の se_mood と直接対応
 """
 
 import io
@@ -140,4 +144,36 @@ def list_se_preset_names() -> List[str]:
 def get_se_preset_bytes(name: str) -> Optional[bytes]:
     """プリセット名からWAVバイト列を生成して返す（存在しない名前ならNone）"""
     fn = SE_PRESETS.get(name)
+    return fn() if fn else None
+
+
+# ============================================================
+# 【NEW】AIによる場面ごとのSE使い分け（「AIにおまかせ」機能用）
+# ============================================================
+
+# ai/model.py の generate_edit_plan が highlight_moments に付与する "se_mood" と
+# 直接対応する、英語キーのマッピング。UI表示用の日本語ラベル(SE_PRESETS)とは別に、
+# プログラムからムード名で直接引けるようにしている。
+_MOOD_TO_GENERATOR: Dict[str, Callable[[], bytes]] = {
+    "ding": generate_ding,       # 嬉しい・発見・ポジティブな驚き
+    "impact": generate_impact,   # 強い衝撃・シリアスな驚き
+    "whoosh": generate_whoosh,   # 場面転換・テンポの良い切り替え
+    "pop": generate_pop,         # 軽いリアクション・ちょっとしたツッコミ
+    "buzz": generate_buzz,       # 残念・失敗・警告
+    "tada": generate_tada,       # 達成・成功・締めくくり
+}
+
+MOOD_CHOICES: List[str] = list(_MOOD_TO_GENERATOR.keys())
+
+
+def get_se_bytes_by_mood(mood: Optional[str]) -> Optional[bytes]:
+    """
+    ai/model.py の generate_edit_plan() が各ハイライト瞬間に付与する se_mood
+    （"ding"/"impact"/"whoosh"/"pop"/"buzz"/"tada"）から、対応する効果音の
+    WAVバイト列を生成して返す。「AIにおまかせ」でSEを場面ごとに使い分ける機能で使用する。
+    未知の値・Noneの場合はNoneを返す（呼び出し側で安全にスキップされる）。
+    """
+    if not mood:
+        return None
+    fn = _MOOD_TO_GENERATOR.get(mood)
     return fn() if fn else None

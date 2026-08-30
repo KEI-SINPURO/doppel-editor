@@ -29,6 +29,12 @@ pipeline.py  ―  「動画を再現する」の一連の処理を、UI(app.py)�
     フレーム画像を抜き出し、ai/model.py の generate_edit_plan() に渡すようにした
     （Claudeが実際の映像も見た上でハイライト・強調を判断できるようにするため）。
     既定はオフ（毎回のAPI呼び出しに画像が乗る＝料金が増えるため）。
+  - 【NEW】render_options の "se_ai_auto" が True の場合、highlight_moments の
+    se_mood（ai/model.pyがハイライトごとに付与する盛り上がりの種類）に応じて、
+    features/se_presets.py の効果音を場面ごとに自動で使い分ける
+    （insert_multiple_se）。従来は動画全体で1種類の効果音しか使えなかった。
+  - 【NEW】BGMミックス（mix_bgm）に、セリフ区間(sub_segments)を渡すようにした。
+    セリフ中は自動でBGM音量を下げる「自動ダッキング」が常時適用される。
 """
 
 from typing import Optional, Dict, Any, Callable, List
@@ -46,7 +52,8 @@ from features.generate import (
     auto_cut_by_style_with_mapping, decide_transition_from_style,
     filter_segments_by_keep_flags, trim_filler_word_edges, generate_with_subtitles, generate_srt,
 )
-from features.branding import overlay_logo, mix_bgm, insert_se, add_narration
+from features.branding import overlay_logo, mix_bgm, insert_se, insert_multiple_se, add_narration
+from features.se_presets import get_se_bytes_by_mood
 from features.audio_quality import normalize_audio_loudness, apply_noise_gate
 
 # 映像参照モード時、ハイライト候補が1件も無かった場合に均等サンプリングするフレーム数
@@ -191,6 +198,7 @@ def render_final_video(
             "use_font": bool, "font_path": str|None,
             "bgm_path": str|None,
             "se_path": str|None,
+            "se_ai_auto": bool,  # True の場合、se_pathより優先して場面ごとにAIが効果音を使い分ける
             "narration_path": str|None, "narration_duck_db": float,
             "normalize_audio": bool, "noise_gate": bool,
             "export_preset": dict|None,  # features/export_presets.py の値をそのまま渡せる
@@ -283,7 +291,17 @@ def render_final_video(
         output = apply_color_grade(output, grade_style) or output
 
     se_path = render_options.get("se_path")
-    if se_path and highlight_moments:
+    se_ai_auto = render_options.get("se_ai_auto", False)
+    if se_ai_auto and highlight_moments:
+        # 【NEW】場面のトーン（se_mood）に応じて、効果音の種類を自動で使い分ける。
+        # se_moodが付いていないハイライト（ヒューリスティック判定時など）は "impact" で代替する。
+        _progress(52, "AIが場面ごとに効果音を選んで配置中...")
+        timed_se = [
+            (h["start"], get_se_bytes_by_mood(h.get("se_mood") or "impact"))
+            for h in highlight_moments[:5]
+        ]
+        output = insert_multiple_se(output, timed_se) or output
+    elif se_path and highlight_moments:
         _progress(52, "ハイライトシーンに効果音を配置中...")
         se_timestamps = [h["start"] for h in highlight_moments[:5]]
         output = insert_se(output, se_path, se_timestamps) or output
@@ -303,8 +321,10 @@ def render_final_video(
         output = overlay_logo(output, render_options["logo_path"]) or output
 
     if render_options.get("bgm_path"):
-        _progress(80, "BGMをミックス中...")
-        output = mix_bgm(output, render_options["bgm_path"]) or output
+        # 【NEW】セリフ区間(sub_segments)を渡し、その間だけBGM音量を自動で下げる
+        # 「自動ダッキング」を常時適用する（プロの編集の基本テクニック）。
+        _progress(80, "BGMをミックス中（セリフ中は自動ダッキング）...")
+        output = mix_bgm(output, render_options["bgm_path"], speech_segments=sub_segments) or output
 
     if render_options.get("narration_path"):
         _progress(85, "ナレーションを合成中...")

@@ -10,6 +10,11 @@ STEP2「新しい動画に再現する」のコア処理:
          カットで前方の時間が詰まった分、テロップ・ハイライト等の時刻がズレるのを防ぐために使う
   1c. filter_segments_by_keep_flags()
        … AI/ヒューリスティックが「不要」と判定した発言区間を、元のセグメント列から安全に除外する
+  1d. trim_filler_word_edges()（NEW）
+       … keepと判定されたセグメントでも、冒頭・末尾がフィラー語（「えー」「あの」等）だけの
+         場合は、その部分だけを時間的に切り詰める（発言の中身自体は残す）。
+         「フィラー語が混じっている＝発言ごとカット」ではなく、実際の編集者がよくやる
+         「発言は残しつつ言い淀みだけ削る」という細かい編集を再現するための処理。
   2. generate_with_subtitles() … 学習したテロップの見た目（色・サイズ・位置・フォント）で焼き込み
   3. generate_srt() … 字幕ファイル(.srt)の書き出し（編集ソフトへの取り込み用）
 """
@@ -29,6 +34,10 @@ except ImportError:
     HAS_MOVIEPY = False
 
 import numpy as np
+
+# trim_filler_word_edges() でフィラー語判定に使う基準リストを features/analyze.py と共有する
+# （2箇所で別々にメンテナンスすると判定基準がズレるため、こちらは再定義せずimportする）
+from features.analyze import FILLER_WORDS
 
 
 # ============================================================
@@ -312,6 +321,81 @@ def filter_segments_by_keep_flags(original_segments: list, plan_segments: list) 
     return kept or original_segments
 
 
+def trim_filler_word_edges(segments: list, min_trim: float = 0.3) -> list:
+    """
+    【NEW】各セグメントの冒頭・末尾に「えー」「あの」等のフィラー語だけの単語区間が
+    連続している場合、その部分だけを時間的に切り詰める（発言本文はそのまま残す）。
+
+    これまでの実装では、AI/ヒューリスティックの keep/cut 判定は「セグメントを
+    丸ごと残すか消すか」の二択しか無く、「発言の中身は必要だが、冒頭の『えっと』だけは
+    プロの編集者なら削る」というよくあるケースを再現できなかった。
+    本関数は、そのギャップを埋めるための決定的（AIを使わない）な後処理。
+
+    Args:
+        segments : filter_segments_by_keep_flags() 通過後の「残す」セグメント列。
+                   features/transcribe.py で word_timestamps=True にして取得した
+                   "words": [{"word","start","end",...}, ...] があるセグメントのみ処理対象。
+                   words が無いセグメントはそのまま（何もせず）返す＝安全にフォールバック。
+        min_trim : これ未満の秒数の削りは行わない（誤検出によるノイズ的トリムを防ぐ）。
+                   後段の auto_cut_by_style 等が発話区間の前後に付与するpadding
+                   （既定0.10〜0.20秒）で打ち消されて意味が無くならないよう、
+                   それより十分大きい値を既定にしている。
+
+    Returns:
+        トリム後のsegmentsのコピー（元のリストは変更しない）。
+
+    【注意】Whisperの日本語における単語（トークン）分割は、英語のような分かち書きと違い
+    1トークンが数文字程度になることが多い。そのため「ちょっと待って」のような複合的な
+    フィラー表現は複数トークンに分かれ、本関数の単純な単一トークン一致では検出できない
+    場合がある（その場合はセグメント丸ごとのkeep/cut判定側に委ねられる）。
+    あくまで「えー」「あの」など短い相槌の除去を狙った、控えめで安全な補助処理。
+    """
+    trimmed = []
+    for seg in segments:
+        words = seg.get("words") or []
+        if not words:
+            trimmed.append(dict(seg))
+            continue
+
+        new_start = seg.get("start", 0)
+        new_end = seg.get("end", 0)
+        strip_chars = "、。！？!? 　\n"
+
+        # 冒頭のフィラー語ランを検出（最低1語は必ず本文として残す）
+        i = 0
+        while i < len(words) - 1:
+            w = (words[i].get("word") or "").strip(strip_chars)
+            if w and w in FILLER_WORDS:
+                i += 1
+            else:
+                break
+        if i > 0:
+            candidate = words[i].get("start", new_start)
+            if candidate - new_start >= min_trim:
+                new_start = candidate
+
+        # 末尾のフィラー語ランを検出
+        j = len(words) - 1
+        while j > 0:
+            w = (words[j].get("word") or "").strip(strip_chars)
+            if w and w in FILLER_WORDS:
+                j -= 1
+            else:
+                break
+        if j < len(words) - 1:
+            candidate = words[j].get("end", new_end)
+            if new_end - candidate >= min_trim:
+                new_end = candidate
+
+        new_seg = dict(seg)
+        if new_end > new_start:
+            new_seg["start"] = new_start
+            new_seg["end"] = new_end
+        trimmed.append(new_seg)
+
+    return trimmed
+
+
 def _decide_cut_params(style_data: Optional[dict]) -> Tuple[float, float]:
     """学習した「カットのリズム」からpadding/min_gapを決める。"""
     style_data = style_data or {}
@@ -350,7 +434,7 @@ def auto_cut_by_style(
     transition: str = "cut",
 ) -> Optional[bytes]:
     """
-    学習した「カットのリズム」(style_data["rhythm"])を padding・min_gap に反映したうえで
+    学習した「カットのリズム」(style_data["rhythm"])を padding・min_gapに反映したうえで
     auto_cut_by_segments を呼ぶラッパー。学習データが無い場合は従来通りのデフォルト値で動作する。
     """
     padding, min_gap = _decide_cut_params(style_data)

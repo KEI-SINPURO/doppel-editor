@@ -13,24 +13,61 @@ pipeline.py  ―  「動画を再現する」の一連の処理を、UI(app.py)�
 処理は2段階に分かれる:
   1. build_edit_plan()    … 文字起こし → AI/ヒューリスティックの編集プラン作成（軽い処理）
   2. render_final_video() … 確認・修正済みのプランをもとに実際の動画を書き出す（重い処理）
+
+【今回のアップデート（精度優先）】
+  - 音量・キーワードの盛り上がり検出（features/effects.py）は、AIが使える場合でも
+    常に計算し、ai/model.py の generate_edit_plan() へ「参考ヒント」として渡すようにした
+    （以前はAI未使用時のフォールバックでのみ計算していた）。
+  - AIが highlight_moments を1件も返さなかった場合の保険として、検出結果から
+    変換したものを使うようにした（_highlights_from_detected）。
+  - render_final_video() で、キープされたセグメントに対して
+    features/generate.py の trim_filler_word_edges() を追加適用し、
+    冒頭・末尾のフィラー語だけを自動的に切り詰めるようにした。
+  - build_edit_plan() が Whisper の精度設定（model_size / beam_size）を
+    そのまま受け渡せるようにした（省略時は features/transcribe.py の既定値を使用）。
+  - 環境変数 DOPPEL_VISUAL_MODE=on の場合、features/frames.py でハイライト候補付近の
+    フレーム画像を抜き出し、ai/model.py の generate_edit_plan() に渡すようにした
+    （Claudeが実際の映像も見た上でハイライト・強調を判断できるようにするため）。
+    既定はオフ（毎回のAPI呼び出しに画像が乗る＝料金が増えるため）。
 """
 
 from typing import Optional, Dict, Any, Callable, List
 
-from ai.model import generate_edit_plan
+from ai.model import generate_edit_plan, is_visual_mode_enabled
 from ai.heuristic import build_heuristic_edit_plan
 
 from features.transcribe import transcribe_video
+from features.frames import extract_frames_at_timestamps
 from features.effects import (
     detect_highlight_moments, apply_color_grade, apply_zoom_effect,
     apply_speed_ramp, auto_reframe,
 )
 from features.generate import (
     auto_cut_by_style_with_mapping, decide_transition_from_style,
-    filter_segments_by_keep_flags, generate_with_subtitles, generate_srt,
+    filter_segments_by_keep_flags, trim_filler_word_edges, generate_with_subtitles, generate_srt,
 )
 from features.branding import overlay_logo, mix_bgm, insert_se, add_narration
 from features.audio_quality import normalize_audio_loudness, apply_noise_gate
+
+# 映像参照モード時、ハイライト候補が1件も無かった場合に均等サンプリングするフレーム数
+_VISUAL_FALLBACK_FRAME_COUNT = 6
+_VISUAL_MAX_FRAMES = 6
+
+
+def _highlights_from_detected(detected_highlights: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    features/effects.py の detect_highlight_moments()の出力（"timestamp"キー）を、
+    レンダリング側が期待する {"start","end","reason"} 形式に変換する。
+    AIが highlight_moments を1件も返さなかった場合の保険として使う。
+    """
+    return [
+        {
+            "start": h.get("timestamp", 0),
+            "end": h.get("end", h.get("timestamp", 0) + 0.5),
+            "reason": f"キーワード/音量検出（スコア {h.get('score', 0)}）",
+        }
+        for h in sorted(detected_highlights, key=lambda x: x.get("score", 0), reverse=True)[:5]
+    ]
 
 
 def build_edit_plan(
@@ -38,10 +75,19 @@ def build_edit_plan(
     style_data: Optional[dict],
     style_label: str = "",
     reinforcement_text: str = "",
-    model_size: str = "tiny",
+    model_size: Optional[str] = None,
+    beam_size: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     文字起こし → 編集プラン作成までを行う（動画の書き出しはまだ行わない・軽い処理）。
+
+    Args:
+        video_bytes : 対象動画
+        style_data / style_label / reinforcement_text: 従来通り
+        model_size  : Whisperのモデルサイズ。省略時は features/transcribe.py の既定
+                      （環境変数 WHISPER_MODEL_SIZE。既定 "medium"）を使う
+        beam_size   : Whisperのビームサーチ幅。省略時は features/transcribe.py の既定
+                      （環境変数 WHISPER_BEAM_SIZE。既定 5）を使う
 
     Returns:
         {
@@ -53,20 +99,42 @@ def build_edit_plan(
         }
         文字起こし自体に失敗した場合は None。
     """
-    result = transcribe_video(video_bytes, language="ja", model_size=model_size)
+    result = transcribe_video(video_bytes, language="ja", model_size=model_size, beam_size=beam_size)
     if not result:
         return None
     segments = result["segments"]
 
-    plan = generate_edit_plan(segments, style_data, style_label, reinforcement_text)
+    # 音量・キーワードの盛り上がり検出は、AIの判断材料としても・フォールバックとしても
+    # 使うため、AIが使えるかどうかに関わらず常に計算しておく。
+    detected_highlights = detect_highlight_moments(video_bytes, segments)
+
+    # 映像参照モード（DOPPEL_VISUAL_MODE=on）が有効なら、ハイライト候補付近の
+    # フレーム画像も抜き出してAIに渡す（毎回コストが増えるため既定はオフ）。
+    frame_images = None
+    if is_visual_mode_enabled():
+        candidate_ts = [h.get("timestamp", 0) for h in detected_highlights[:_VISUAL_MAX_FRAMES]]
+        if not candidate_ts and segments:
+            # ハイライト候補が無い場合は、動画全体からほぼ均等にサンプリングする
+            total_end = segments[-1].get("end", 0)
+            if total_end > 0:
+                candidate_ts = [
+                    total_end * (i + 0.5) / _VISUAL_FALLBACK_FRAME_COUNT
+                    for i in range(_VISUAL_FALLBACK_FRAME_COUNT)
+                ]
+        if candidate_ts:
+            frame_images = extract_frames_at_timestamps(video_bytes, candidate_ts, max_frames=_VISUAL_MAX_FRAMES)
+
+    plan = generate_edit_plan(
+        segments, style_data, style_label, reinforcement_text,
+        highlight_hints=detected_highlights, frame_images=frame_images,
+    )
     if plan and plan.get("segments"):
         plan_segments = plan["segments"]
-        highlight_moments = plan.get("highlight_moments", [])
+        highlight_moments = plan.get("highlight_moments") or _highlights_from_detected(detected_highlights)
         notes = plan.get("notes", "")
         ai_used = True
     else:
         # AIキー未設定・エラー時のフォールバック（ai/heuristic.py）
-        detected_highlights = detect_highlight_moments(video_bytes, segments)
         heuristic_plan = build_heuristic_edit_plan(segments, detected_highlights, style_data)
         plan_segments = heuristic_plan["segments"]
         highlight_moments = heuristic_plan["highlight_moments"]
@@ -158,6 +226,9 @@ def render_final_video(
 
     _progress(8, "学習したテンポ・カットの癖でカット・トランジションを適用中...")
     cut_source_segments = filter_segments_by_keep_flags(segments, sub_segments)
+    # 残すと判定された発言でも、冒頭・末尾のフィラー語（「えー」「あの」等）だけは
+    # さらに自動でトリムする（word-level timestampsが無いセグメントはそのまま通過する）
+    cut_source_segments = trim_filler_word_edges(cut_source_segments)
     cut_video, time_map = auto_cut_by_style_with_mapping(
         video_bytes, cut_source_segments, style_data, transition=transition,
     )

@@ -13,6 +13,16 @@ ai/learning.py  ―  フィードバック学習（プロンプトベースの�
   モデルの重みは変えていませんが、使うたびに文脈として「そのユーザー専用の
   参考データ」が渡るため、実質的に「使うほど自分に近づく」体験を実現できます。
 
+【今回のアップデート（さらにAI強化）】
+  - 従来は「良い評価」の例のみを強化データとして使っていたが、「改善が必要」だった
+    例も「この傾向は避ける」という参考情報として使うように拡張した。良い例だけでは
+    「何をすべきか」しか学べず、「何をすべきでないか」（過去に嫌がられた具体的な
+    傾向）を再現に活かせていなかったため。
+  - 例の選択時に、可能であれば現在使おうとしているスタイル（style_label）に一致する
+    フィードバックを優先するようにした（ジャンルが違うスタイル同士でフィードバックが
+    混ざり、的外れな学習をしてしまうのを防ぐ）。一致する例が足りない場合は、
+    他のスタイルの例で補う（データが少ない段階で強化データが空になるのを防ぐため）。
+
 保存先: ~/.doppel_editor/training/<editor_id>/
   examples.json … フィードバック履歴
   profile.json  … 評価数などの集計プロファイル
@@ -24,7 +34,8 @@ from datetime import datetime
 from typing import Dict, List
 
 _BASE_DIR = os.path.expanduser("~/.doppel_editor/training")
-_MAX_EXAMPLES_IN_PROMPT = 3
+_MAX_GOOD_EXAMPLES_IN_PROMPT = 3
+_MAX_BAD_EXAMPLES_IN_PROMPT = 2
 
 
 def _dir(editor_id: str) -> str:
@@ -107,20 +118,46 @@ class FeedbackLearner:
             profile["style_scores"] = scores
         _write_json(self._profile_path(), profile)
 
-    def build_reinforcement_prompt(self) -> str:
+    def _select_examples(self, examples: List[Dict], rating_value: int, limit: int, style_label: str) -> List[Dict]:
+        """
+        指定したrating（+1 or -1）の例から、新しい順に最大limit件を選ぶ。
+        style_label が指定されていれば、一致する例を優先し、
+        足りない分は他のスタイルの例で補う（データが少ない段階で0件になるのを防ぐため）。
+        """
+        pool = [e for e in examples if e.get("rating") == rating_value]
+        if style_label:
+            matching = sorted(
+                [e for e in pool if e.get("style_label") == style_label],
+                key=lambda x: x.get("timestamp", ""), reverse=True,
+            )
+            others = sorted(
+                [e for e in pool if e.get("style_label") != style_label],
+                key=lambda x: x.get("timestamp", ""), reverse=True,
+            )
+            ordered = matching + others
+        else:
+            ordered = sorted(pool, key=lambda x: x.get("timestamp", ""), reverse=True)
+        return ordered[:limit]
+
+    def build_reinforcement_prompt(self, style_label: str = "") -> str:
         """
         Claude API のシステムプロンプトに注入する「このユーザー専用の強化テキスト」を組み立てる。
-        過去の高評価の提案例を few-shot として渡すことで、疑似的なファインチューニング効果を狙う。
+        過去の高評価の提案例を「再現すべき傾向」、低評価の例を「避けるべき傾向」として
+        few-shot 的に渡すことで、疑似的なファインチューニング効果を狙う。
         データがまだ少ない場合は空文字列を返す（＝一般的な提案にフォールバックする）。
+
+        Args:
+            style_label: 現在使おうとしているスタイル名。指定すると、そのスタイルの
+                         フィードバックを優先的に使う（他ジャンルのフィードバックが
+                         混ざって的外れな学習になるのを防ぐ）。省略時は全スタイル横断で選ぶ。
         """
         examples = _read_json(self._examples_path(), [])
         profile = _read_json(self._profile_path(), {})
 
-        good = [e for e in examples if e.get("rating") == 1]
-        good_sorted = sorted(good, key=lambda x: x["timestamp"], reverse=True)
-        top = good_sorted[:_MAX_EXAMPLES_IN_PROMPT]
+        good = self._select_examples(examples, 1, _MAX_GOOD_EXAMPLES_IN_PROMPT, style_label)
+        bad = self._select_examples(examples, -1, _MAX_BAD_EXAMPLES_IN_PROMPT, style_label)
 
-        if not top and profile.get("total_ratings", 0) < 1:
+        if not good and not bad and profile.get("total_ratings", 0) < 1:
             return ""
 
         lines = ["【このユーザー専用の強化データ（過去の評価から学習した傾向）】"]
@@ -129,10 +166,15 @@ class FeedbackLearner:
                 f"評価実績: 全{profile.get('total_ratings', 0)}件中、"
                 f"良い評価 {profile.get('good_ratings', 0)}件 / 改善要求 {profile.get('bad_ratings', 0)}件"
             )
-        for ex in top:
-            lines.append(f"- 過去に高評価だった提案・編集の例: 「{ex['response'][:200]}」")
-        if top:
-            lines.append("この傾向を最優先で反映し、一貫性のある提案・編集をしてください。")
+        for ex in good:
+            lines.append(f"- 過去に高評価だった提案・編集の例（この傾向を再現する）: 「{ex['response'][:200]}」")
+        for ex in bad:
+            lines.append(f"- 過去に「改善が必要」だった提案・編集の例（この傾向は避ける）: 「{ex['response'][:200]}」")
+        if good or bad:
+            lines.append(
+                "良い例の傾向を最優先で再現しつつ、悪い例で示されたパターンは繰り返さないよう、"
+                "一貫性のある提案・編集をしてください。"
+            )
         return "\n".join(lines)
 
     def get_stats(self) -> Dict:

@@ -23,6 +23,8 @@ app.py  ―  Doppel Editor メインアプリケーション（v2: スコープ�
       確認・修正できるプレビュー画面（pipeline.py に処理を分離）
     - 【NEW】音量正規化・簡易ノイズゲート・プラットフォーム別の書き出し設定プリセット
     - 【NEW】複数の動画をまとめて自動編集するバッチ処理タブ（ZIP一括ダウンロード）
+    - 【NEW・精度優先アップデート】学習時の文字起こしを高精度設定（既定 medium＋
+      ビームサーチ）で実行し、サイドバーに現在の精度設定（Whisper／AI品質モード）を表示
 
   処理の実体（文字起こし→編集プラン作成→動画書き出し）は pipeline.py に切り出してあり、
   「動画を再現する」タブとバッチ処理タブの両方から共通で使っている。
@@ -31,7 +33,6 @@ app.py  ―  Doppel Editor メインアプリケーション（v2: スコープ�
 import streamlit as st
 import sys
 import os
-import time
 import tempfile
 import zipfile
 import io
@@ -41,7 +42,7 @@ st.set_page_config(
     page_title="Doppel Editor",
     page_icon="🎬",
     layout="wide",
-    initial_sidebar_state="locked",
+    initial_sidebar_state="expanded",
 )
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -75,11 +76,15 @@ from ai.auth import (
     sign_up, sign_in, sign_out, sign_in_with_google, exchange_code_for_session,
     load_editors_remote, save_editor_remote, delete_editor_remote, save_feedback_remote,
 )
-from ai.model import is_ai_ready, get_thumbnail_suggestion
+from ai.model import (
+    is_ai_ready, get_thumbnail_suggestion, get_quality_mode,
+    is_visual_mode_enabled, describe_visual_editing_style,
+)
 from ai.learning import FeedbackLearner
 
-from features.transcribe import transcribe_video, get_plain_text, estimate_time
+from features.transcribe import transcribe_video, get_plain_text, estimate_time, get_transcribe_quality_label
 from features.analyze import analyze_style, analyze_brightness, analyze_editing_patterns
+from features.frames import extract_frames_at_timestamps
 from features.generate import concatenate_source_clips
 from features.se_presets import list_se_preset_names, get_se_preset_bytes
 from features.media_library import list_bgm_presets
@@ -286,20 +291,14 @@ def _make_progress_cb(bar):
     """
     st.progress() が返すバー(DeltaGenerator)を、pipeline.render_final_video() が
     期待する Callable[[int, str], None] 形式のコールバックに変換する。
-    過去のレンダリング時間の平均から「残り時間の目安」を算出し、
-    進捗率(%)とあわせてバーの文言に表示する。
+
+    ループ内でそのまま `lambda p, txt: bar.progress(...)` を作ると、
+    ①bar.progress()の戻り値(DeltaGenerator)が型不一致になる、
+    ②forループ変数の遅延束縛でバーの参照がズレる、という2つの問題があるため、
+    ファクトリ関数として明示的に切り出している。
     """
-    ss = st.session_state
-    avg_seconds = ss.get("render_avg_seconds", 240.0)  # 初回は4分を仮の目安にする
-    start = time.time()
-
     def _cb(p: int, txt: str) -> None:
-        elapsed = time.time() - start
-        remaining = max(avg_seconds - elapsed, 1)
-        bar.progress(p, text=f"{txt}　{p}%　経過 {elapsed:.0f}秒 ／ 残り目安 約{remaining:.0f}秒")
-        if p >= 100:
-            ss["render_avg_seconds"] = round(avg_seconds * 0.7 + elapsed * 0.3, 1)
-
+        bar.progress(p, text=txt)
     return _cb
 
 
@@ -359,8 +358,6 @@ def handle_oauth_callback():
             st.session_state["user"] = result["user"]
             st.session_state["session"] = result["session"]
             st.session_state["page"] = "home_main" if load_editors() else "home_initial"
-        else:
-            st.session_state["_oauth_error"] = result.get("error")  # ← 追加
         st.rerun()
 
 
@@ -456,6 +453,23 @@ def _sidebar_content():
     </div>
     """, unsafe_allow_html=True)
 
+    # 【NEW】精度優先チューニングの現在値を表示（Whisperの設定・編集プラン生成のAI品質モード）。
+    # .env / 環境変数（WHISPER_MODEL_SIZE, WHISPER_BEAM_SIZE, DOPPEL_QUALITY_MODE）で
+    # 変更できることの気づきにもなるよう、簡潔に出しておく。
+    quality_mode_label = "最高品質（Opus）" if get_quality_mode() == "max" else "標準（Sonnet）"
+    whisper_quality_label = get_transcribe_quality_label()
+    visual_mode_label = "ON（映像も参照）" if is_visual_mode_enabled() else "OFF（テキストのみ）"
+    st.markdown(f"""
+    <div style="background:{t['bg_card']};border:0.5px solid {t['border']};border-radius:10px;
+        padding:10px 14px;margin-top:8px;font-size:11px;color:{t['text_secondary']};line-height:1.9;">
+        <div style="font-size:10px;font-weight:600;color:{t['text_secondary']};letter-spacing:0.1em;
+            text-transform:uppercase;margin-bottom:4px;">精度設定</div>
+        文字起こし: {whisper_quality_label}<br>
+        編集プラン: {quality_mode_label}<br>
+        映像参照: {visual_mode_label}
+    </div>
+    """, unsafe_allow_html=True)
+
     st.markdown(f"<div style='height:1px;background:{t['border']};margin:12px 0;'></div>", unsafe_allow_html=True)
 
     user = st.session_state.get("user")
@@ -502,11 +516,7 @@ def render_auth():
         if g.get("success"):
             st.link_button("🔵 Googleでログイン", g["url"], use_container_width=True)
         else:
-            st.caption(f"Googleログインは現在利用できません: {g.get('error')}")
-
-        oauth_error = st.session_state.pop("_oauth_error", None)
-        if oauth_error:
-            st.error(f"Googleログインの最終処理でエラーが発生しました: {oauth_error}")
+            st.caption("Googleログインは現在利用できません（Supabase側の設定が必要です）")
 
         st.markdown("<div style='text-align:center;color:#666;font-size:12px;margin:10px 0;'>または</div>",
                      unsafe_allow_html=True)
@@ -846,8 +856,30 @@ def render_learn_tab(editor: dict, eid: str):
                     f"フィラー語除去率 約{int(patterns.get('filler_removal_rate', 0) * 100)}%／"
                     f"カットは文の区切りで行われる傾向 約{int(patterns.get('boundary_tendency', 0) * 100)}%"
                 )
+                # 【NEW】位置別の残す割合・構成の並び替え傾向・フィラー語トリム傾向を、
+                # データがある場合だけ追加表示する（古い学習データにはこれらのキーが無いため、
+                # .get() で安全にスキップされる）
+                pos = patterns.get("position_bias") or {}
+                pos_parts = [f"{label} {int(ratio * 100)}%" for label, ratio in pos.items() if ratio is not None]
+                extra_bits = []
+                if pos_parts:
+                    extra_bits.append(f"位置別に残す割合（{' / '.join(pos_parts)}）")
+                reordering = patterns.get("reordering_rate")
+                if reordering:
+                    extra_bits.append(f"構成の並び替え傾向 指標{reordering}（参考情報・再現機能は未対応）")
+                trim = patterns.get("trim_stats")
+                if trim:
+                    extra_bits.append(
+                        f"フィラー語を冒頭平均{trim.get('avg_trim_start_tokens', 0)}語・"
+                        f"末尾平均{trim.get('avg_trim_end_tokens', 0)}語ぶん自動トリム対象として検出"
+                    )
+                if extra_bits:
+                    st.caption("🔍 " + " ／ ".join(extra_bits))
             else:
                 st.caption("💡 「編集前の素材動画」も一緒にアップロードすると、カットの癖まで学習できます")
+
+            if sd.get("subtitle_voice"):
+                st.caption(f"🗣️ 学習したテロップの文体：{sd['subtitle_voice']}")
 
             new_label = st.text_input("名前を変更", value=s.get("label", ""), key=f"rename_{sid}") or s.get("label", "")
             cb1, cb2 = st.columns(2)
@@ -893,60 +925,65 @@ def render_learn_tab(editor: dict, eid: str):
         up_edit = st.file_uploader("完成動画", type=["mp4", "mov", "avi", "mkv", "webm"], key="learn_edit")
 
     if up_edit and st.button("この動画からスタイルを学習する", type="primary", use_container_width=True, key="learn_btn"):
-        ss = st.session_state
-        RATE_KEY = "whisper_tiny_sec_per_mb"
-        # 「1MBあたり何秒かかるか」を実測して学習していく（初回は保守的な仮の値）
-        rate = ss.get(RATE_KEY, 12.0)
+        with st.spinner("動画を解析中..."):
+            style_data = analyze_style(up_edit.getvalue())
+            brightness = analyze_brightness(up_edit.getvalue())
 
-        def _mb(data: bytes) -> float:
-            return len(data) / (1024 * 1024)
+            editing_patterns = None
+            if up_raw and style_data:
+                st.caption("編集前素材と比較して「カットの癖」も学習しています…（少し時間がかかります）")
+                # 同じ動画をもう一度アップロードしなくて済むよう、raw/edited 双方をここで
+                # 一度だけ文字起こしし、「どこが残されて、どこが削られたか」を比較する。
+                # ※ ここは以前 model_size="tiny" を明示していたが、raw/edited比較の精度が
+                #   そのまま「カットの癖」学習の精度に直結するため、features/transcribe.py の
+                #   高精度な既定設定（既定 medium・ビームサーチ・単語レベルタイムスタンプ）を
+                #   そのまま使うようにした。
+                raw_result = transcribe_video(up_raw.getvalue(), language="ja")
+                edited_result = transcribe_video(up_edit.getvalue(), language="ja")
+                if raw_result and edited_result:
+                    editing_patterns = analyze_editing_patterns(
+                        raw_result["segments"], edited_result["segments"],
+                    )
+                    if editing_patterns:
+                        style_data["editing_patterns"] = editing_patterns
 
-        style_budget = 20.0
-        total_budget = style_budget
-        if up_raw:
-            total_budget += rate * _mb(up_raw.getvalue()) + rate * _mb(up_edit.getvalue())
+            # 【NEW】編集後動画のテロップが写っているフレームから、Claude Visionで
+            # 「テロップの文体・言い回しの雰囲気」を学習する（AIが使える場合のみ。
+            # 1スタイルの学習につき1回だけの軽いコストなので、DOPPEL_VISUAL_MODEの
+            # 設定に関わらず常に実行する）。
+            subtitle_voice = None
+            if style_data and is_ai_ready():
+                subtitle_timestamps = [
+                    r["timestamp"] for r in style_data.get("subtitle_regions", []) if r.get("timestamp") is not None
+                ]
+                if subtitle_timestamps:
+                    st.caption("テロップの文体を分析しています…")
+                    # 検出された全タイミングを使うと偏るため、均等に間引いて代表的な数枚に絞る
+                    step = max(1, len(subtitle_timestamps) // 6)
+                    sample_ts = subtitle_timestamps[::step][:6]
+                    frames = extract_frames_at_timestamps(up_edit.getvalue(), sample_ts, max_frames=6)
+                    subtitle_voice = describe_visual_editing_style(frames)
+                    if subtitle_voice:
+                        style_data["subtitle_voice"] = subtitle_voice
 
-        start = time.time()
-        bar = st.progress(0.0, text="動画を解析中…　準備中")
-
-        def _update(pct: int, label: str, budget_known: bool = True):
-            elapsed = time.time() - start
-            if budget_known:
-                remaining = max(total_budget - elapsed, 3)
-                suffix = f"経過 {elapsed:.0f}秒 ／ 残り目安 約{remaining:.0f}秒"
-            else:
-                suffix = f"経過 {elapsed:.0f}秒 ／ 残り時間を計測中…"
-            bar.progress(pct / 100, text=f"{label}…　{pct}%　{suffix}")
-
-        _update(5, "テロップ・カットを解析中")
-        style_data = analyze_style(up_edit.getvalue())
-        _update(15, "明るさ・色調を解析中")
-        brightness = analyze_brightness(up_edit.getvalue())
-
-        editing_patterns = None
-        if up_raw and style_data:
-            raw_bytes = up_raw.getvalue()
-            _update(20, "編集前素材を文字起こし中（動画が長いと数分かかることがあります）", budget_known=False)
-            t0 = time.time()
-            raw_result = transcribe_video(raw_bytes, language="ja", model_size="tiny")
-            raw_elapsed = time.time() - t0
-            raw_mb = _mb(raw_bytes)
-            if raw_mb > 0.5:
-                measured_rate = raw_elapsed / raw_mb
-                rate = round(rate * 0.3 + measured_rate * 0.7, 2)
-                ss[RATE_KEY] = rate
-                total_budget = style_budget + raw_elapsed + rate * _mb(up_edit.getvalue())
-
-            _update(60, "完成動画を文字起こし中")
-            edited_result = transcribe_video(up_edit.getvalue(), language="ja", model_size="tiny")
-            if raw_result and edited_result:
-                editing_patterns = analyze_editing_patterns(
-                    raw_result["segments"], edited_result["segments"],
+        if style_data:
+            save_style_data(eid, target_sid, style_data, brightness)
+            add_video_to_style(eid, target_sid, {
+                "title": up_edit.name, "with_raw": up_raw.name if up_raw else None,
+            })
+            _sync_editor(eid)
+            msg = "学習が完了しました！「動画を再現する」タブで使えます。"
+            if editing_patterns:
+                msg += (
+                    f"（素材の約{int(editing_patterns.get('keep_ratio', 1) * 100)}%を残す傾向、"
+                    f"フィラー語除去率 約{int(editing_patterns.get('filler_removal_rate', 0) * 100)}% を学習しました）"
                 )
-                if editing_patterns:
-                    style_data["editing_patterns"] = editing_patterns
-
-        _update(100, "完了")
+            st.success(msg)
+            if subtitle_voice:
+                st.caption(f"🗣️ 学習したテロップの文体：{subtitle_voice}")
+            st.rerun()
+        else:
+            st.error("動画の解析に失敗しました。ファイル形式をご確認ください。")
 
 
 # ── タブ2: 動画を再現する（★ 今回の核となる機能） ──────────────────────
@@ -1035,7 +1072,7 @@ def render_reproduce_tab(editor: dict, eid: str):
                 st.error("素材の結合に失敗しました。ファイル形式をご確認ください。")
                 return
             learner = FeedbackLearner(eid)
-            reinforcement = learner.build_reinforcement_prompt()
+            reinforcement = learner.build_reinforcement_prompt(style.get("label", ""))
             plan = build_edit_plan(video_bytes, style_data, style.get("label", ""), reinforcement)
         if not plan:
             st.error("文字起こしに失敗しました。動画ファイルをご確認ください。")
@@ -1199,7 +1236,7 @@ def render_batch_tab(editor: dict, eid: str):
     if st.button(f"📦 {len(batch_files)}本をまとめて自動編集する", type="primary",
                  use_container_width=True, key="run_batch_btn"):
         learner = FeedbackLearner(eid)
-        reinforcement = learner.build_reinforcement_prompt()
+        reinforcement = learner.build_reinforcement_prompt(style.get("label", ""))
         results = []
         overall = st.progress(0, text="バッチ処理を開始します...")
 
@@ -1276,7 +1313,7 @@ def render_thumbnail_tab(editor: dict, eid: str):
         else:
             learner = FeedbackLearner(eid)
             stream = get_thumbnail_suggestion(
-                txt, style_data, style_label, learner.build_reinforcement_prompt(), stream=True,
+                txt, style_data, style_label, learner.build_reinforcement_prompt(style_label), stream=True,
             )
             suggestion = run_ai_with_progress(stream, label="サムネイル案を生成中")
             st.session_state["last_thumbnail"] = suggestion

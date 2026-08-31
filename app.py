@@ -33,6 +33,7 @@ app.py  ―  Doppel Editor メインアプリケーション（v2: スコープ�
 import streamlit as st
 import sys
 import os
+import gc
 import tempfile
 import zipfile
 import io
@@ -83,7 +84,9 @@ from ai.model import (
 )
 from ai.learning import FeedbackLearner
 
-from features.transcribe import transcribe_video, get_plain_text, estimate_time, get_transcribe_quality_label
+from features.transcribe import (
+    transcribe_video, get_plain_text, estimate_time, get_transcribe_quality_label, DEFAULT_MODEL_SIZE,
+)
 from features.analyze import analyze_style, analyze_brightness, analyze_editing_patterns
 from features.frames import extract_frames_at_timestamps
 from features.generate import concatenate_source_clips
@@ -937,46 +940,86 @@ def render_learn_tab(editor: dict, eid: str):
         up_edit = st.file_uploader("完成動画", type=["mp4", "mov", "avi", "mkv", "webm"], key="learn_edit")
 
     if up_edit and st.button("この動画からスタイルを学習する", type="primary", use_container_width=True, key="learn_btn"):
-        with st.spinner("動画を解析中..."):
-            style_data = analyze_style(up_edit.getvalue())
-            brightness = analyze_brightness(up_edit.getvalue())
+        # 【NEW】重い文字起こし設定のまま、メモリの少ない環境（Streamlit Community Cloud
+        # 無料枠など）で実行すると、メモリ不足でアプリごと強制終了することがある
+        # （OSレベルの強制終了のため、Python側のtry/exceptでは防げない）。事前に注意を出す。
+        if DEFAULT_MODEL_SIZE not in ("tiny", "base", "small"):
+            st.info(
+                f"💡 現在の文字起こし設定は精度優先の「{DEFAULT_MODEL_SIZE}」です。"
+                "メモリの少ない環境（Streamlit Community Cloud無料枠など）では、"
+                "この後の処理中に落ちることがあります。落ちる場合は、デプロイ先のSecretsに "
+                "`WHISPER_MODEL_SIZE = \"small\"` を追加してください。"
+            )
 
-            editing_patterns = None
-            if up_raw and style_data:
-                st.caption("編集前素材と比較して「カットの癖」も学習しています…（少し時間がかかります）")
-                # 同じ動画をもう一度アップロードしなくて済むよう、raw/edited 双方をここで
-                # 一度だけ文字起こしし、「どこが残されて、どこが削られたか」を比較する。
-                # ※ ここは以前 model_size="tiny" を明示していたが、raw/edited比較の精度が
-                #   そのまま「カットの癖」学習の精度に直結するため、features/transcribe.py の
-                #   高精度な既定設定（既定 medium・ビームサーチ・単語レベルタイムスタンプ）を
-                #   そのまま使うようにした。
-                raw_result = transcribe_video(up_raw.getvalue(), language="ja")
-                edited_result = transcribe_video(up_edit.getvalue(), language="ja")
-                if raw_result and edited_result:
-                    editing_patterns = analyze_editing_patterns(
-                        raw_result["segments"], edited_result["segments"],
-                    )
-                    if editing_patterns:
-                        style_data["editing_patterns"] = editing_patterns
+        # 【NEW】従来はst.spinnerで「動画を解析中...」と表示するだけで、あとどれくらい
+        # かかるか分からなかった。段階ごとに進捗バー・時間目安を表示するようにした。
+        total_steps = 2 + (2 if up_raw else 0)  # カット/テロップ解析・明るさ解析（+raw/edited文字起こし）
+        progress_bar = st.progress(0.0, text="準備中...")
+        progress_step = 0
 
-            # 【NEW】編集後動画のテロップが写っているフレームから、Claude Visionで
-            # 「テロップの文体・言い回しの雰囲気」を学習する（AIが使える場合のみ。
-            # 1スタイルの学習につき1回だけの軽いコストなので、DOPPEL_VISUAL_MODEの
-            # 設定に関わらず常に実行する）。
-            subtitle_voice = None
-            if style_data and is_ai_ready():
-                subtitle_timestamps = [
-                    r["timestamp"] for r in style_data.get("subtitle_regions", []) if r.get("timestamp") is not None
-                ]
-                if subtitle_timestamps:
-                    st.caption("テロップの文体を分析しています…")
-                    # 検出された全タイミングを使うと偏るため、均等に間引いて代表的な数枚に絞る
-                    step = max(1, len(subtitle_timestamps) // 6)
-                    sample_ts = subtitle_timestamps[::step][:6]
-                    frames = extract_frames_at_timestamps(up_edit.getvalue(), sample_ts, max_frames=6)
-                    subtitle_voice = describe_visual_editing_style(frames)
-                    if subtitle_voice:
-                        style_data["subtitle_voice"] = subtitle_voice
+        def _advance(done_label: str, next_label: str = ""):
+            nonlocal progress_step
+            progress_step += 1
+            text = f"{done_label}（{progress_step}/{total_steps}）"
+            if next_label:
+                text += f" … 次: {next_label}"
+            progress_bar.progress(min(progress_step / total_steps, 1.0), text=text)
+
+        style_data = analyze_style(up_edit.getvalue())
+        _advance("カット・テロップを解析", "明るさ・色調の解析")
+        brightness = analyze_brightness(up_edit.getvalue())
+        _advance("明るさ・色調を解析")
+
+        editing_patterns = None
+        if up_raw and style_data:
+            # ※ 以前は model_size="tiny" を明示していたが、raw/edited比較の精度が
+            #   そのまま「カットの癖」学習の精度に直結するため、features/transcribe.py の
+            #   既定設定（環境変数 WHISPER_MODEL_SIZE 等）をそのまま使うようにしている。
+            eta_raw = estimate_time(up_raw.getvalue())
+            progress_bar.progress(
+                progress_step / total_steps, text=f"編集前素材を文字起こし中…（目安 {eta_raw}）",
+            )
+            raw_result = transcribe_video(up_raw.getvalue(), language="ja")
+            _advance("編集前素材の文字起こし完了")
+            gc.collect()  # 直後のedited側の文字起こしに備え、使い終わった分のメモリを解放しておく
+
+            eta_edited = estimate_time(up_edit.getvalue())
+            progress_bar.progress(
+                progress_step / total_steps, text=f"完成動画を文字起こし中…（目安 {eta_edited}）",
+            )
+            edited_result = transcribe_video(up_edit.getvalue(), language="ja")
+            _advance("完成動画の文字起こし完了")
+            gc.collect()
+
+            if raw_result and edited_result:
+                editing_patterns = analyze_editing_patterns(
+                    raw_result["segments"], edited_result["segments"],
+                )
+                if editing_patterns:
+                    style_data["editing_patterns"] = editing_patterns
+            else:
+                st.warning("文字起こしに失敗した動画があったため、「カットの癖」の学習はスキップしました。")
+
+        progress_bar.progress(1.0, text="解析完了")
+
+        # 編集後動画のテロップが写っているフレームから、Claude Visionで
+        # 「テロップの文体・言い回しの雰囲気」を学習する（AIが使える場合のみ。
+        # 1スタイルの学習につき1回だけの軽いコストなので、DOPPEL_VISUAL_MODEの
+        # 設定に関わらず常に実行する）。
+        subtitle_voice = None
+        if style_data and is_ai_ready():
+            subtitle_timestamps = [
+                r["timestamp"] for r in style_data.get("subtitle_regions", []) if r.get("timestamp") is not None
+            ]
+            if subtitle_timestamps:
+                st.caption("テロップの文体を分析しています…")
+                # 検出された全タイミングを使うと偏るため、均等に間引いて代表的な数枚に絞る
+                sample_stride = max(1, len(subtitle_timestamps) // 6)
+                sample_ts = subtitle_timestamps[::sample_stride][:6]
+                frames = extract_frames_at_timestamps(up_edit.getvalue(), sample_ts, max_frames=6)
+                subtitle_voice = describe_visual_editing_style(frames)
+                if subtitle_voice:
+                    style_data["subtitle_voice"] = subtitle_voice
 
         if style_data:
             save_style_data(eid, target_sid, style_data, brightness)

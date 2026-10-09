@@ -140,7 +140,14 @@ def get_css(theme_name: str) -> str:
             border-color: {t['accent']}66 !important; color: {t['accent']} !important;
         }}
 
-        [data-testid="stSidebarCollapsedControl"] {{
+        /* ★ サイドバー折りたたみ時のトグルボタン。
+           Streamlitのバージョンによって data-testid が変わりうるため、
+           複数の候補セレクタに同じスタイルを当てて、どのバージョンでも
+           少なくともデフォルトの表示が完全に隠れないようにしている
+           （以前は単一セレクタへの !important 上書きのみで、そのセレクタが
+           該当バージョンに存在しない場合にトグルが見えなくなる報告があったための対応）。 */
+        [data-testid="stSidebarCollapsedControl"],
+        [data-testid="collapsedControl"] {{
             position: fixed !important; top: 50% !important; left: 0px !important;
             transform: translateY(-50%) !important; z-index: 999999 !important;
             display: flex !important; visibility: visible !important; opacity: 1 !important;
@@ -151,15 +158,18 @@ def get_css(theme_name: str) -> str:
             cursor: pointer !important; box-shadow: 4px 0 20px {t['accent_sub']}88 !important;
             transition: width 0.2s ease, box-shadow 0.2s ease !important;
         }}
-        [data-testid="stSidebarCollapsedControl"]:hover {{
+        [data-testid="stSidebarCollapsedControl"]:hover,
+        [data-testid="collapsedControl"]:hover {{
             width: 44px !important; box-shadow: 6px 0 28px {t['accent']}aa !important;
         }}
-        [data-testid="stSidebarCollapsedControl"] button {{
+        [data-testid="stSidebarCollapsedControl"] button,
+        [data-testid="collapsedControl"] button {{
             background: transparent !important; border: none !important;
             width: 100% !important; height: 100% !important; padding: 0 !important;
             display: flex !important; align-items: center !important; justify-content: center !important;
         }}
-        [data-testid="stSidebarCollapsedControl"] svg {{
+        [data-testid="stSidebarCollapsedControl"] svg,
+        [data-testid="collapsedControl"] svg {{
             stroke: #ffffff !important; fill: none !important; width: 20px !important; height: 20px !important;
         }}
         [data-testid="stSidebarCollapseButton"] button {{
@@ -183,21 +193,7 @@ def get_css(theme_name: str) -> str:
         .stButton > button p, div[data-testid="stButton"] > button p {{
             color: inherit !important; font-size: 13px !important;
         }}
-        div[data-testid="stLinkButton"] a {{
-            background-color: {t['button_bg']} !important; color: {t['text_primary']} !important;
-            border: 0.5px solid {t['border']} !important; border-radius: 8px !important;
-            padding: 10px 18px !important; font-size: 13px !important; font-weight: 400 !important;
-            display: flex !important; align-items: center !important; justify-content: center !important;
-            width: 100% !important; text-decoration: none !important;
-            transition: background-color 0.2s, border-color 0.2s, color 0.2s !important;
-        }}
-        div[data-testid="stLinkButton"] a:hover {{
-            background-color: {t['button_hover']} !important; border-color: {t['accent']}88 !important;
-            color: {t['accent']} !important;
-        }}
-        div[data-testid="stLinkButton"] a p {{
-            color: inherit !important; font-size: 13px !important; margin: 0 !important;
-        }}
+
         div[data-testid="stButton"] button[kind="primary"],
         button[data-testid="baseButton-primary"], .stButton button[kind="primary"] {{
             background: linear-gradient(135deg, {t['accent_sub']}, {t['accent']}) !important;
@@ -278,24 +274,6 @@ def get_css(theme_name: str) -> str:
         [data-testid="stFileUploader"] p, [data-testid="stFileUploader"] span {{ color: {t['text_primary']} !important; }}
         [data-testid="stFileUploaderDropzoneInstructions"] span,
         [data-testid="stFileUploaderDropzoneInstructions"] small {{ color: {t['text_secondary']} !important; }}
-
-        [data-testid="stFileUploaderFile"] {{
-            background-color: {t['bg_secondary']} !important;
-            border: 0.5px solid {t['border']} !important; border-radius: 8px !important;
-        }}
-        [data-testid="stFileUploaderFileName"] {{
-            color: {t['text_primary']} !important; font-size: 13px !important;
-        }}
-        [data-testid="stFileUploaderFile"] small,
-        [data-testid="stFileUploaderFile"] span {{
-            color: {t['text_secondary']} !important;
-        }}
-        [data-testid="stFileUploaderDeleteBtn"] button {{
-            color: {t['text_secondary']} !important; background: transparent !important;
-        }}
-        [data-testid="stFileUploaderDeleteBtn"] button:hover {{
-            color: {t['error']} !important;
-        }}
 
         .stRadio label p {{ color: {t['text_primary']} !important; font-size: 14px !important; }}
         .stMultiSelect > div > div {{

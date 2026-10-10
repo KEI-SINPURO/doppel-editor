@@ -8,22 +8,28 @@ STEP2「新しい動画に再現する」の最初のステップとして、
   - AIによる編集プラン生成（ai/model.py の generate_edit_plan）
 の入力として使う。
 
-【今回の変更点（精度優先チューニング）】
-  「多少重くなっても、その編集者そのものだと思えるレベルの精度がほしい」という方針に合わせ、
-  既定値を "tiny"（最速・低精度）から、より高精度な設定に引き上げた。
-    - DEFAULT_MODEL_SIZE : 既定 "medium"（環境変数 WHISPER_MODEL_SIZE で上書き可）
-    - DEFAULT_BEAM_SIZE  : 既定 5 のビームサーチ（環境変数 WHISPER_BEAM_SIZE で上書き可。
-                            0 または空文字を指定すると従来の貪欲デコードに戻る）
-    - word_timestamps=True を常時有効化し、単語（トークン）単位のタイムスタンプを取得。
+【今回の変更点（精度優先チューニング → 安定性優先に再調整）】
+  当初は「多少重くなっても精度がほしい」という方針で既定値を "tiny" から "medium"
+  （+ビームサーチ）まで引き上げていたが、実際にStreamlit Community Cloudの無料枠に
+  デプロイしたところ、メモリ不足によるアプリ強制終了（OOM Kill。Python側の例外処理では
+  防げない）が繰り返し発生したため、既定値を安全側の "small"・貪欲デコードに戻した。
+
+  無料枠でも落ちにくい既定値にしつつ、環境変数で精度を引き上げられるようにしている：
+    - DEFAULT_MODEL_SIZE : 既定 "small"（環境変数 WHISPER_MODEL_SIZE で上書き可。
+                            メモリに余裕のある環境なら "medium"/"large-v3" 等に上げられる）
+    - DEFAULT_BEAM_SIZE  : 既定 None（貪欲デコード。環境変数 WHISPER_BEAM_SIZE で
+                            例えば "5" 等を指定するとビームサーチに切り替えられる）
+    - word_timestamps=True は常時有効化し、単語（トークン）単位のタイムスタンプを取得。
       features/analyze.py の「フィラー語トリム傾向」の学習や、
       features/generate.py の trim_filler_word_edges()（発言の中身は残したまま、
-      冒頭・末尾のフィラー語だけをわずかに削る処理）の入力として使う。
+      冒頭・末尾のフィラー語だけをわずかに削る処理）の入力として使う
+      （word_timestamps自体のメモリ・処理時間への影響は比較的小さい）。
 
   ★ 重要な注意（README.md も参照）：
     "medium" 以上のモデルは、Streamlit Community Cloudの無料枠（メモリ約1GB）では
-    メモリ不足でアプリが落ちる可能性が高い。無料枠のまま使う場合は
-    環境変数 WHISPER_MODEL_SIZE=small （またはbase/tiny）に落とすか、
-    Render.com・VPS等メモリに余裕のある環境への移行を検討してください。
+    メモリ不足でアプリが落ちる可能性が高い。精度を上げたい場合は、まず
+    Render.com・VPS等メモリに余裕のある環境への移行を検討したうえで、
+    環境変数 WHISPER_MODEL_SIZE を medium/large-v3 等に設定してください。
 """
 
 from __future__ import annotations
@@ -54,8 +60,8 @@ def _read_beam_size(raw: str) -> Optional[int]:
         return 5
 
 
-DEFAULT_MODEL_SIZE: str = os.getenv("WHISPER_MODEL_SIZE", "medium")
-DEFAULT_BEAM_SIZE: Optional[int] = _read_beam_size(os.getenv("WHISPER_BEAM_SIZE", "5"))
+DEFAULT_MODEL_SIZE: str = os.getenv("WHISPER_MODEL_SIZE", "small")
+DEFAULT_BEAM_SIZE: Optional[int] = _read_beam_size(os.getenv("WHISPER_BEAM_SIZE", ""))
 
 
 def get_transcribe_quality_label() -> str:
@@ -101,9 +107,9 @@ def transcribe_video(
         video_bytes : 動画ファイルのバイト列
         language    : 音声言語（"ja" = 日本語）
         model_size  : "tiny" / "base" / "small" / "medium" / "large-v3" 等。
-                      省略した場合は DEFAULT_MODEL_SIZE（環境変数 WHISPER_MODEL_SIZE、既定"medium"）を使う。
+                      省略した場合は DEFAULT_MODEL_SIZE（環境変数 WHISPER_MODEL_SIZE、既定"small"）を使う。
         beam_size   : ビームサーチの幅。大きいほど精度が上がる一方、処理時間も伸びる。
-                      省略した場合は DEFAULT_BEAM_SIZE（環境変数 WHISPER_BEAM_SIZE、既定5）を使う。
+                      省略した場合は DEFAULT_BEAM_SIZE（環境変数 WHISPER_BEAM_SIZE、既定None＝貪欲デコード）を使う。
                       Noneを明示的に渡すと、その呼び出しだけ高速な貪欲デコードにできる。
 
     Returns:
